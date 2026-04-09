@@ -1,0 +1,29 @@
+{
+  "required": ["arrival_date", "is_canceled"],
+  "optional_for_revenue": ["adr", "stays_in_weekend_nights", "stays_in_week_nights"],
+  "columns": {
+    "arrival_date":                    {"type": "datetime", "description": "Guest arrival date",                          "example": "2017-05-15"},
+    "is_canceled":                     {"type": "int",      "description": "1=cancelled, 0=not cancelled",                "example": 0},
+    "lead_time":                       {"type": "int",      "description": "Days between booking and arrival",            "example": 45},
+    "adr":                             {"type": "float",    "description": "Average Daily Rate",                          "example": 115.50},
+    "adults":                          {"type": "int",      "description": "Number of adults",                            "example": 2},
+    "children":                        {"type": "int",      "description": "Number of children",                          "example": 0},
+    "babies":                          {"type": "int",      "description": "Number of babies",                            "example": 0},
+    "stays_in_weekend_nights":         {"type": "int",      "description": "Weekend nights booked",                       "example": 1},
+    "stays_in_week_nights":            {"type": "int",      "description": "Weeknight stays booked",                      "example": 3},
+    "hotel":                           {"type": "str",      "description": "Hotel type",                                  "example": "City Hotel"},
+    "meal":                            {"type": "str",      "description": "Meal plan code",                              "example": "BB"},
+    "country":                         {"type": "str",      "description": "Guest country of origin (ISO 3166)",          "example": "PRT"},
+    "market_segment":                  {"type": "str",      "description": "Market segment",                              "example": "Online TA"},
+    "distribution_channel":            {"type": "str",      "description": "Booking distribution channel",               "example": "TA/TO"},
+    "customer_type":                   {"type": "str",      "description": "Guest classification",                        "example": "Transient"},
+    "reserved_room_type":              {"type": "str",      "description": "Reserved room category",                      "example": "A"},
+    "total_of_special_requests":       {"type": "int",      "description": "Number of special requests made",             "example": 1},
+    "is_repeated_guest":               {"type": "int",      "description": "1 if repeat guest, 0 otherwise",              "example": 0},
+    "previous_cancellations":          {"type": "int",      "description": "Prior cancellations by this guest",           "example": 0},
+    "previous_bookings_not_canceled":  {"type": "int",      "description": "Prior completed bookings by this guest",      "example": 0},
+    "required_car_parking_spaces":     {"type": "int",      "description": "Parking spaces requested",                   "example": 0},
+    "agent":                           {"type": "int",      "description": "Booking agent ID (0 = no agent)",             "example": 0},
+    "company":                         {"type": "int",      "description": "Booking company ID (0 = no company)",         "example": 0}
+  }
+}
