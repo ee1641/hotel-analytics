@@ -1,0 +1,9 @@
+{
+  "hotel_id": "demo",
+  "hotel_name": "Demo Hotel (Portugal)",
+  "total_rooms": 100,
+  "currency": "EUR",
+  "timezone": "Europe/Lisbon",
+  "overbooking_cost": 150.0,
+  "empty_room_cost": 100.0
+}
