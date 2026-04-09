@@ -34,7 +34,9 @@ from src import model_cache
 from src.ingestion import load_cancellation_prediction_csv
 from src.cancellation_evaluation import evaluate_cross_dataset
 
+import os
 DATA_PATH = "hotel_bookings.csv"
+APP_MODE = os.getenv("APP_MODE", "demo")
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +261,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+if APP_MODE == "demo":
+    st.info("📊 You're viewing demo data from a sample hotel. Upload your own data to see your hotel's insights.")
 
 st.title("🏨 Hotel Analytics Dashboard")
 st.markdown(
