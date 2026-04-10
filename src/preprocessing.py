@@ -4,28 +4,69 @@ Data loading, cleaning, feature engineering, and encoding for hotel bookings.
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+from src.ingestion import normalize_uploaded_dataframe
 
 
 def load_data(path: str) -> pd.DataFrame:
     """Load hotel_bookings.csv and return raw DataFrame."""
-    return pd.read_csv(path)
+    return normalize_uploaded_dataframe(pd.read_csv(path))
 
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Fix data quality issues:
+    - remove accidental exact duplicate booking rows
     - agent/company NULL  -> 0 (no agent / no company)
     - country NULL        -> 'Unknown'
     - children NULL       -> 0
     - adr < 0             -> 0 (invalid rates)
     """
-    df = df.copy()
+    df = remove_accidental_duplicate_bookings(df.copy())
+
+    defaults = {
+        "agent": 0,
+        "company": 0,
+        "country": "Unknown",
+        "children": 0,
+        "babies": 0,
+        "adults": 2,
+        "adr": 0.0,
+        "stays_in_weekend_nights": 0,
+        "stays_in_week_nights": 1,
+        "hotel": "Custom Hotel",
+        "meal": "BB",
+        "market_segment": "Direct",
+        "distribution_channel": "Direct",
+        "customer_type": "Transient",
+        "reserved_room_type": "A",
+        "total_of_special_requests": 0,
+        "is_repeated_guest": 0,
+        "previous_cancellations": 0,
+        "previous_bookings_not_canceled": 0,
+        "required_car_parking_spaces": 0,
+    }
+    for col, value in defaults.items():
+        if col not in df.columns:
+            df[col] = value
+
     df["agent"] = df["agent"].fillna(0).astype(int)
     df["company"] = df["company"].fillna(0).astype(int)
     df["country"] = df["country"].fillna("Unknown")
     df["children"] = df["children"].fillna(0).astype(int)
-    df["adr"] = df["adr"].clip(lower=0)
+    df["babies"] = df["babies"].fillna(0).astype(int)
+    df["adults"] = df["adults"].fillna(2).astype(int)
+    df["adr"] = pd.to_numeric(df["adr"], errors="coerce").fillna(0.0).clip(lower=0)
     return df
+
+
+def remove_accidental_duplicate_bookings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove exact duplicate booking rows before downstream analysis.
+
+    This is intentionally conservative: only rows that are identical across all
+    currently available columns are removed.
+    """
+    return df.drop_duplicates().reset_index(drop=True)
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,8 +78,43 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["total_nights"] = df["stays_in_weekend_nights"] + df["stays_in_week_nights"]
     df["total_guests"] = df["adults"] + df["children"] + df["babies"]
-    df["revenue"] = (df["adr"] * df["total_nights"]).clip(lower=0)
+    df = ensure_revenue_columns(df)
+    if "reservation_status" not in df.columns:
+        df["reservation_status"] = "Check-Out"
     df["is_no_show"] = (df["reservation_status"] == "No-Show").astype(int)
+    return df
+
+
+def ensure_revenue_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the shared revenue columns exist on any booking-level DataFrame.
+
+    This is idempotent so callers can safely apply it to filtered frames or
+    older cached/uploaded frames before aggregation.
+    """
+    df = df.copy()
+
+    def _series_or_default(column_name: str, default_value: float = 0.0) -> pd.Series:
+        if column_name in df.columns:
+            return pd.to_numeric(df[column_name], errors="coerce").fillna(default_value)
+        return pd.Series(default_value, index=df.index, dtype=float)
+
+    if "total_nights" not in df.columns:
+        weekend = _series_or_default("stays_in_weekend_nights", 0.0)
+        week = _series_or_default("stays_in_week_nights", 0.0)
+        df["total_nights"] = weekend + week
+
+    if "revenue" not in df.columns:
+        adr = _series_or_default("adr", 0.0).clip(lower=0)
+        df["revenue"] = (adr * df["total_nights"]).clip(lower=0)
+
+    if "booked_revenue" not in df.columns:
+        df["booked_revenue"] = df["revenue"]
+
+    if "realized_revenue" not in df.columns:
+        is_canceled = _series_or_default("is_canceled", 0.0)
+        df["realized_revenue"] = (df["revenue"] * (1 - is_canceled.astype(float))).clip(lower=0)
+
     return df
 
 

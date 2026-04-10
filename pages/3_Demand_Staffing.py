@@ -19,9 +19,8 @@ st.set_page_config(page_title="Demand & Staffing", page_icon="👥", layout="wid
 st.title("👥 Demand & Staffing Planner")
 
 try:
-    with st.spinner("Loading models..."):
-        _, daily_df = load_and_prepare_data()
-        models = get_or_train_models()
+    _, daily_df = load_and_prepare_data()
+    models = get_or_train_models()
 except Exception as e:
     st.error(f"Failed to load data or models: {e}")
     st.stop()

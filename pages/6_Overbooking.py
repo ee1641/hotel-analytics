@@ -22,14 +22,16 @@ st.markdown(
 )
 
 try:
-    with st.spinner("Loading models..."):
-        df, _ = load_and_prepare_data()
-        models = get_or_train_models()
+    df, _ = load_and_prepare_data()
+    models = get_or_train_models()
 except Exception as e:
     st.error(f"Failed to load data or models: {e}")
     st.stop()
 
 cancel_model = models["cancel_models"]["xgboost"]
+feature_columns = models["feature_columns"]
+label_encoders = models["label_encoders"]
+feature_defaults = models["feature_defaults"]
 
 # ---------------------------------------------------------------------------
 # Sidebar controls
@@ -55,6 +57,9 @@ rec = calculate_overbooking_recommendation(
     df, cancel_model, target_date, total_rooms,
     overbooking_cost=float(overbooking_cost),
     empty_room_cost=float(empty_room_cost),
+    feature_columns=feature_columns,
+    label_encoders=label_encoders,
+    feature_defaults=feature_defaults,
 )
 
 _RISK_ICON = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
@@ -103,7 +108,13 @@ if len(day_bookings) == 0:
     st.info("No non-cancelled bookings found for this date in the dataset.")
 else:
     try:
-        scored = score_bookings(day_bookings, cancel_model)
+        scored = score_bookings(
+            day_bookings,
+            cancel_model,
+            feature_columns=feature_columns,
+            label_encoders=label_encoders,
+            feature_defaults=feature_defaults,
+        )
         display_cols = [c for c in ["cancel_probability", "risk_tier", "lead_time", "adr", "market_segment", "customer_type"] if c in scored.columns]
         st.dataframe(
             scored[display_cols].head(25).style.format(

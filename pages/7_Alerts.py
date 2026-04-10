@@ -18,9 +18,8 @@ st.title("🔔 Actionable Alerts")
 st.markdown("Real-time alerts generated from your cancellation model and demand forecasts.")
 
 try:
-    with st.spinner("Loading models..."):
-        df, daily_df = load_and_prepare_data()
-        models = get_or_train_models()
+    df, daily_df = load_and_prepare_data()
+    models = get_or_train_models()
 except Exception as e:
     st.error(f"Failed to load data or models: {e}")
     st.stop()

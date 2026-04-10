@@ -4,6 +4,7 @@ Allows any hotel CSV to be mapped to the canonical schema used by the ML pipelin
 """
 import json
 import difflib
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -110,6 +111,63 @@ _KNOWN_ALIASES: dict[str, str] = {
     "check in": "arrival_date",
 }
 
+_PROTECTED_PASSTHROUGH_COLUMNS: set[str] = {
+    "arrival_date_year",
+    "arrival_date_month",
+    "arrival_date_week_number",
+    "arrival_date_day_of_month",
+    "assigned_room_type",
+    "deposit_type",
+    "booking_changes",
+    "days_in_waiting_list",
+    "reservation_status",
+    "reservation_status_date",
+}
+
+
+def _arrival_date_candidates(df: pd.DataFrame) -> list[str]:
+    pattern = re.compile(r"^arrival_date(?:\.\d+)?$")
+    return [col for col in df.columns if pattern.match(str(col))]
+
+
+def _choose_best_arrival_date_column(df: pd.DataFrame, candidates: list[str]) -> tuple[str | None, pd.Series | None]:
+    best_col = None
+    best_score = None
+    best_parsed = None
+
+    for col in candidates:
+        parsed = pd.to_datetime(df[col], format="mixed", errors="coerce")
+        valid = int(parsed.notna().sum())
+        unique = int(parsed.nunique(dropna=True))
+        text_hint = int(any(("-" in str(v) or "/" in str(v)) for v in df[col].dropna().head(20)))
+        score = (valid, unique, text_hint, len(str(col)))
+        if best_score is None or score > best_score:
+            best_col = col
+            best_score = score
+            best_parsed = parsed
+
+    return best_col, best_parsed
+
+
+def normalize_uploaded_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Repair upload-mapping issues before validation/preprocessing.
+
+    This primarily fixes duplicate arrival_date columns caused by auto-mapping
+    split Kaggle date parts onto the canonical arrival_date name.
+    """
+    df = df.copy()
+    candidates = _arrival_date_candidates(df)
+    if candidates:
+        best_col, parsed = _choose_best_arrival_date_column(df, candidates)
+        if best_col is not None and parsed is not None:
+            df["arrival_date"] = parsed.dt.normalize()
+            drop_cols = [col for col in candidates if col != "arrival_date"]
+            if drop_cols:
+                df = df.drop(columns=drop_cols, errors="ignore")
+
+    return df
+
 
 def auto_detect_columns(df: pd.DataFrame, similarity_threshold: float = 0.6) -> dict:
     """
@@ -125,6 +183,12 @@ def auto_detect_columns(df: pd.DataFrame, similarity_threshold: float = 0.6) -> 
 
     for user_col in df.columns:
         user_lower = user_col.lower().replace("_", " ").strip()
+
+        if user_col in CANONICAL_SCHEMA["columns"]:
+            mapping[user_col] = user_col
+            continue
+        if user_col in _PROTECTED_PASSTHROUGH_COLUMNS:
+            continue
 
         # 1. Check known aliases first (exact match after normalisation)
         if user_lower in _KNOWN_ALIASES:

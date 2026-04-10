@@ -1,18 +1,23 @@
 """
-Page 0 — Data Upload
+Page 0 - Data Upload
 Upload your own hotel CSV and map its columns to the canonical schema.
 All other pages will use this data if provided, falling back to the built-in demo.
 """
 import warnings
 warnings.filterwarnings("ignore")
 
-import io
 import pandas as pd
 import streamlit as st
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.ingestion import auto_detect_columns, map_columns, validate_schema, CANONICAL_SCHEMA
+from src.data_context import (
+    activate_streamlit_context,
+    activate_streamlit_demo,
+    persist_streamlit_upload,
+    resolve_streamlit_dataset_context,
+)
+from src.ingestion import auto_detect_columns, map_columns, normalize_uploaded_dataframe, validate_schema, CANONICAL_SCHEMA
 
 st.set_page_config(page_title="Data Upload", page_icon="📂", layout="wide")
 st.title("📂 Data Upload & Schema Mapping")
@@ -21,29 +26,23 @@ st.markdown(
     "All other dashboard pages will automatically use your data once mapped."
 )
 
-# ---------------------------------------------------------------------------
-# Demo dataset shortcut
-# ---------------------------------------------------------------------------
 if st.button("Use Built-in Kaggle Demo Dataset", type="secondary"):
+    activate_streamlit_demo(st.session_state)
     st.session_state.pop("user_df", None)
     st.session_state.pop("user_daily_df", None)
     st.success("Demo dataset selected. All pages will use the built-in Kaggle dataset.")
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# File upload
-# ---------------------------------------------------------------------------
 uploaded = st.file_uploader("Upload hotel bookings CSV", type=["csv"])
 
 if uploaded is not None:
     try:
         raw_df = pd.read_csv(uploaded)
-        st.write(f"Loaded **{len(raw_df):,} rows** × **{len(raw_df.columns)} columns**")
+        st.write(f"Loaded **{len(raw_df):,} rows** x **{len(raw_df.columns)} columns**")
         with st.expander("Preview raw data"):
             st.dataframe(raw_df.head(5), use_container_width=True)
 
-        # Auto-detect column mappings
         suggested = auto_detect_columns(raw_df)
         canonical_options = ["(skip)"] + list(CANONICAL_SCHEMA["columns"].keys())
 
@@ -72,13 +71,15 @@ if uploaded is not None:
                     mapping[user_col] = chosen
 
         if st.button("Validate & Apply Mapping", type="primary"):
-            mapped_df = map_columns(raw_df, mapping)
+            mapped_df = normalize_uploaded_dataframe(map_columns(raw_df, mapping))
             is_valid, issues = validate_schema(mapped_df)
 
             if is_valid:
-                st.success("Schema validation passed. Your data is ready to use.")
+                context = persist_streamlit_upload(mapped_df)
+                activate_streamlit_context(st.session_state, context)
                 st.session_state["user_df"] = mapped_df
-                st.session_state.pop("user_daily_df", None)  # force re-aggregation
+                st.session_state.pop("user_daily_df", None)
+                st.success("Schema validation passed. Your data is ready to use.")
             else:
                 st.error("Schema validation failed. Please fix the issues below:")
                 for issue in issues:
@@ -87,15 +88,13 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
-# ---------------------------------------------------------------------------
-# Status indicator
-# ---------------------------------------------------------------------------
 st.divider()
-if "user_df" in st.session_state:
+active_context = resolve_streamlit_dataset_context(st.session_state)
+if active_context.dataset_id != "demo" and "user_df" in st.session_state:
     df = st.session_state["user_df"]
     st.info(
-        f"Active dataset: **custom upload** — {len(df):,} rows. "
+        f"Active dataset: **{active_context.source_label}** - {len(df):,} rows. "
         "All pages are using this data."
     )
 else:
-    st.info("Active dataset: **Kaggle demo** (hotel_bookings.csv). Upload a file above to switch.")
+    st.info(f"Active dataset: **{active_context.source_label}**. Upload a file above to switch.")
