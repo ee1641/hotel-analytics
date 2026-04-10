@@ -173,11 +173,12 @@ def get_or_train_models(data_path: str = DATA_PATH):
         )
         selected_features = select_top_features(shap_df, threshold=0.01)
         os.makedirs("outputs", exist_ok=True)
-        import shap as shap_lib
+        top_shap = shap_df.nlargest(15, "mean_abs_shap")
         fig, ax = plt.subplots(figsize=(8, 6))
-        shap_lib.bar_plot(shap_df["mean_abs_shap"].values,
-                          feature_names=shap_df["feature"].tolist(),
-                          max_display=15, ax=ax, show=False)
+        ax.barh(top_shap["feature"], top_shap["mean_abs_shap"])
+        ax.set_xlabel("Mean |SHAP value|")
+        ax.set_title("Feature Importance (SHAP)")
+        ax.invert_yaxis()
         plt.tight_layout()
         plt.savefig("outputs/shap_summary.png", dpi=120, bbox_inches="tight")
         plt.close()
