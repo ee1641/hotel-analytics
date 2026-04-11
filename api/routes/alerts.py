@@ -1,12 +1,13 @@
 from fastapi import APIRouter, HTTPException, Depends
-from api.auth import verify_api_key
+from api.auth import verify_api_key, check_hotel_ownership
 
 router = APIRouter(prefix="/hotels/{hotel_id}/alerts", tags=["alerts"])
 
 
 @router.get("")
-def get_alerts(hotel_id: str, _: str = Depends(verify_api_key)):
+def get_alerts(hotel_id: str, authenticated_hotel_id: str = Depends(verify_api_key)):
     """Return today's alerts for the hotel."""
+    check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         from src.services import load_and_prepare_data, get_or_train_models
         from src.alerts import generate_daily_alerts

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from datetime import date
-from api.auth import verify_api_key
+from api.auth import verify_api_key, check_hotel_ownership
 
 router = APIRouter(prefix="/hotels/{hotel_id}/overbooking", tags=["overbooking"])
 
@@ -12,9 +12,10 @@ def get_overbooking(
     total_rooms: int = Query(100),
     overbooking_cost: float = Query(150.0),
     empty_room_cost: float = Query(100.0),
-    _: str = Depends(verify_api_key),
+    authenticated_hotel_id: str = Depends(verify_api_key),
 ):
     """Return overbooking recommendation for a specific date."""
+    check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         from src.services import load_and_prepare_data, get_or_train_models
         from src.overbooking import calculate_overbooking_recommendation

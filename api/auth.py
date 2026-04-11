@@ -28,8 +28,17 @@ def create_api_key(hotel_id: str) -> str:
 
 
 def verify_api_key(api_key: str = Security(_header)) -> str:
-    """Return hotel_id if key is valid, else raise 403."""
+    """Return hotel_id if key is valid, else raise 401 Unauthorized."""
     keys = _load_keys()
     if api_key not in keys:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return keys[api_key]
+
+
+def check_hotel_ownership(hotel_id: str, authenticated_hotel_id: str) -> None:
+    """Raise 403 Forbidden if the authenticated key does not belong to hotel_id."""
+    if authenticated_hotel_id != hotel_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: this API key does not belong to the requested hotel",
+        )

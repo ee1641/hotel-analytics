@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from api.auth import verify_api_key, create_api_key
+from api.auth import verify_api_key, create_api_key, check_hotel_ownership
 from src.hotel_manager import HotelManager, HotelConfig, generate_hotel_id
 
 router = APIRouter(prefix="/hotels", tags=["hotels"])
@@ -27,8 +27,9 @@ def create_hotel(body: HotelCreateRequest):
 
 
 @router.get("/{hotel_id}")
-def get_hotel(hotel_id: str, _: str = Depends(verify_api_key)):
+def get_hotel(hotel_id: str, authenticated_hotel_id: str = Depends(verify_api_key)):
     """Get hotel config."""
+    check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         cfg = manager.get_hotel(hotel_id)
         from dataclasses import asdict

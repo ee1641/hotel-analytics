@@ -70,13 +70,31 @@ def test_get_hotel_with_valid_key(client, hotel_and_key):
 def test_invalid_api_key_rejected(client, hotel_and_key):
     hotel_id, _ = hotel_and_key
     resp = client.get(f"/hotels/{hotel_id}", headers={"X-API-Key": "wrong-key"})
+    assert resp.status_code == 401  # invalid key = 401 Unauthorized
+
+
+def test_wrong_hotel_id_returns_403(client, hotel_and_key):
+    """A valid key used to access a different hotel returns 403 Forbidden."""
+    hotel_id, api_key = hotel_and_key
+    resp = client.get("/hotels/some-other-hotel-id", headers={"X-API-Key": api_key})
     assert resp.status_code == 403
 
 
-def test_get_nonexistent_hotel_returns_404(client, hotel_and_key):
-    _, api_key = hotel_and_key
-    resp = client.get("/hotels/does-not-exist", headers={"X-API-Key": api_key})
-    assert resp.status_code == 404
+def test_valid_key_own_hotel_returns_200(client, hotel_and_key):
+    hotel_id, api_key = hotel_and_key
+    resp = client.get(f"/hotels/{hotel_id}", headers={"X-API-Key": api_key})
+    assert resp.status_code == 200
+
+
+def test_cross_hotel_access_blocked(client):
+    """Hotel A's key must not access Hotel B's data."""
+    resp_a = client.post("/hotels/", json={"hotel_name": "Hotel A", "total_rooms": 50})
+    hotel_b_resp = client.post("/hotels/", json={"hotel_name": "Hotel B", "total_rooms": 50})
+    key_a = resp_a.json()["data"]["api_key"]
+    hotel_b_id = hotel_b_resp.json()["data"]["hotel_id"]
+
+    resp = client.get(f"/hotels/{hotel_b_id}", headers={"X-API-Key": key_a})
+    assert resp.status_code == 403
 
 
 def test_list_hotels_requires_auth(client):

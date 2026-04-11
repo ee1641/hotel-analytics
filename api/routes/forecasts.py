@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
-from api.auth import verify_api_key
+from api.auth import verify_api_key, check_hotel_ownership
 
 router = APIRouter(prefix="/hotels/{hotel_id}/forecasts", tags=["forecasts"])
 
@@ -9,9 +9,10 @@ def get_forecast(
     hotel_id: str,
     type: str = Query("revenue", enum=["revenue", "demand"]),
     horizon: int = Query(30, ge=1, le=90),
-    hotel_id_from_key: str = Depends(verify_api_key),
+    authenticated_hotel_id: str = Depends(verify_api_key),
 ):
     """Return revenue or demand forecast for the next `horizon` days."""
+    check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         from src.services import load_and_prepare_data, get_or_train_models
         from src.forecasting import forecast_xgb

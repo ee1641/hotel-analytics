@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from api.auth import verify_api_key
+from api.auth import verify_api_key, check_hotel_ownership
 
 router = APIRouter(prefix="/hotels/{hotel_id}", tags=["cancellations"])
 
@@ -26,9 +26,10 @@ class BookingInput(BaseModel):
 def predict_cancellation(
     hotel_id: str,
     booking: BookingInput,
-    _: str = Depends(verify_api_key),
+    authenticated_hotel_id: str = Depends(verify_api_key),
 ):
     """Predict cancellation probability for a single booking."""
+    check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         import pandas as pd
         from src.services import get_or_train_models
