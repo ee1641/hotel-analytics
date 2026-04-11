@@ -127,3 +127,31 @@ def test_cancellation_csv_mapping_completeness():
                            "stays_in_week_nights", "lead_time", "adr", "is_canceled"}
     mapped_values = set(CANCELLATION_CSV_MAPPING.values())
     assert expected_canonical.issubset(mapped_values)
+
+
+# ---------------------------------------------------------------------------
+# Data capability checks
+# ---------------------------------------------------------------------------
+
+def test_capability_check_missing_adr():
+    from src.data_capabilities import check_page_capabilities
+    available = {"arrival_date", "is_canceled", "lead_time"}
+    warnings = check_page_capabilities(available)
+    assert any("adr" in w.lower() for w in warnings.get("forecasting", []))
+
+
+def test_capability_check_all_present():
+    from src.data_capabilities import check_page_capabilities
+    available = {
+        "arrival_date", "adr", "is_canceled", "lead_time", "adults",
+        "stays_in_week_nights", "stays_in_weekend_nights",
+    }
+    warnings = check_page_capabilities(available)
+    for page, msgs in warnings.items():
+        assert len(msgs) == 0, f"Unexpected warnings for {page}: {msgs}"
+
+
+def test_capability_check_returns_all_pages():
+    from src.data_capabilities import check_page_capabilities, _PAGE_REQUIREMENTS
+    warnings = check_page_capabilities(set())
+    assert set(warnings.keys()) == set(_PAGE_REQUIREMENTS.keys())

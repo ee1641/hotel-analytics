@@ -13,6 +13,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src.ingestion import auto_detect_columns, map_columns, validate_schema, CANONICAL_SCHEMA
+from src.data_capabilities import check_page_capabilities
 
 st.set_page_config(page_title="Data Upload", page_icon="📂", layout="wide")
 st.title("📂 Data Upload & Schema Mapping")
@@ -79,6 +80,22 @@ if uploaded is not None:
                 st.success("Schema validation passed. Your data is ready to use.")
                 st.session_state["user_df"] = mapped_df
                 st.session_state.pop("user_daily_df", None)  # force re-aggregation
+
+                # Show per-page capability warnings based on which columns are present
+                available_cols = set(mapped_df.columns)
+                capability_warnings = check_page_capabilities(available_cols)
+                all_good = all(len(w) == 0 for w in capability_warnings.values())
+                if all_good:
+                    st.success("All dashboard pages are fully supported by your dataset.")
+                else:
+                    st.subheader("Page Compatibility")
+                    st.caption(
+                        "Some pages need columns not present in your file. "
+                        "Those pages will still load but may show inaccurate or empty results."
+                    )
+                    for page, msgs in capability_warnings.items():
+                        for msg in msgs:
+                            st.warning(msg)
             else:
                 st.error("Schema validation failed. Please fix the issues below:")
                 for issue in issues:
