@@ -16,7 +16,7 @@ def get_overbooking(
 ):
     """Return overbooking recommendation for a specific date."""
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.overbooking import calculate_overbooking_recommendation
         df, _ = load_and_prepare_data()
         models = get_or_train_models()

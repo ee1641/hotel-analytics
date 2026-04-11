@@ -8,7 +8,7 @@ router = APIRouter(prefix="/hotels/{hotel_id}/alerts", tags=["alerts"])
 def get_alerts(hotel_id: str, _: str = Depends(verify_api_key)):
     """Return today's alerts for the hotel."""
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.alerts import generate_daily_alerts
         from src.forecasting import forecast_xgb
         df, daily_df = load_and_prepare_data()

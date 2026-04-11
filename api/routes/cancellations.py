@@ -31,7 +31,7 @@ def predict_cancellation(
     """Predict cancellation probability for a single booking."""
     try:
         import pandas as pd
-        from app import get_or_train_models
+        from src.services import get_or_train_models
         from src.preprocessing import drop_leaky_features, encode_categoricals
         models = get_or_train_models()
         df = pd.DataFrame([booking.model_dump()])

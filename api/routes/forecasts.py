@@ -13,7 +13,7 @@ def get_forecast(
 ):
     """Return revenue or demand forecast for the next `horizon` days."""
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.forecasting import forecast_xgb
         _, daily_df = load_and_prepare_data()
         models = get_or_train_models()
