@@ -16,6 +16,10 @@ from src.forecasting import forecast_xgb, forecast_prophet, naive_baseline_forec
 
 st.set_page_config(page_title="Revenue Forecast", page_icon="📈", layout="wide")
 st.title("📈 Revenue & Demand Forecast")
+st.caption(
+    "Revenue and demand figures are aggregated by **arrival date**. "
+    "Multi-night stays are not spread across stay nights."
+)
 
 try:
     with st.spinner("Loading models..."):
@@ -55,7 +59,7 @@ prophet_model = models[prophet_key]
 # ---------------------------------------------------------------------------
 # Metrics row
 # ---------------------------------------------------------------------------
-st.subheader("Model Performance (held-out last 20%)")
+st.subheader("Model Performance — Held-Out Test Set (Last 30 Days, Unseen During Training)")
 m_xgb     = eval_metrics[xgb_metric_key]
 m_prophet = eval_metrics.get(prophet_metric_key, {})
 m_naive   = eval_metrics[naive_key]
@@ -73,6 +77,12 @@ with metric_cols[2]:
     st.markdown("**Naive Baseline**")
     st.metric("MAE",  f"{m_naive['mae']:,.1f}")
     st.metric("MAPE", f"{m_naive['mape']:.1f}%")
+
+st.info(
+    "**Evaluation methodology:** Evaluation models are trained on all data except the final 30 days. "
+    "Metrics above are computed on those 30 days (never seen during training). "
+    "The production forecast below uses models retrained on the full dataset."
+)
 
 # Improvement callout
 if model_choice == "XGBoost":

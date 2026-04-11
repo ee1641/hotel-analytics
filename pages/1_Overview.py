@@ -16,6 +16,10 @@ from src.time_series import aggregate_daily
 
 st.set_page_config(page_title="Overview", page_icon="📊", layout="wide")
 st.title("📊 Overview Dashboard")
+st.caption(
+    "Revenue and booking counts are shown by **arrival date**, not by each night of stay. "
+    "A multi-night booking contributes its full value on the arrival date only."
+)
 
 try:
     df, daily_df = load_and_prepare_data()
@@ -78,7 +82,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Revenue over time
 # ---------------------------------------------------------------------------
-st.subheader("Daily Revenue Over Time")
+st.subheader("Booked Revenue by Arrival Date")
 fig_rev = px.line(
     daily_filtered.reset_index(),
     x="arrival_date",
@@ -92,7 +96,7 @@ st.plotly_chart(fig_rev, use_container_width=True)
 # ---------------------------------------------------------------------------
 # Bookings over time
 # ---------------------------------------------------------------------------
-st.subheader("Daily Bookings Over Time")
+st.subheader("Booking Arrivals per Day")
 fig_bk = px.line(
     daily_filtered.reset_index(),
     x="arrival_date",

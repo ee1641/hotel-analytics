@@ -17,6 +17,10 @@ from src.analytics import estimate_staffing
 
 st.set_page_config(page_title="Demand & Staffing", page_icon="👥", layout="wide")
 st.title("👥 Demand & Staffing Planner")
+st.caption(
+    "Demand figures count bookings by **arrival date**. "
+    "Staffing recommendations are estimates based on expected arrivals, not total room-nights occupied."
+)
 
 try:
     with st.spinner("Loading models..."):
