@@ -26,8 +26,8 @@ class HotelConfig:
 class HotelManager:
     """CRUD manager for hotel configurations stored as JSON files."""
 
-    def __init__(self, data_root: Path = DATA_ROOT):
-        self._root = Path(data_root)
+    def __init__(self, data_root: Path | None = None):
+        self._root = Path(data_root or DATA_ROOT)
         self._root.mkdir(parents=True, exist_ok=True)
 
     def create_hotel(self, config: HotelConfig) -> str:

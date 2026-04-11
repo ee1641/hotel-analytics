@@ -3,6 +3,8 @@ Date construction and daily time-series aggregation for hotel bookings.
 """
 import pandas as pd
 
+from src.preprocessing import ensure_revenue_columns
+
 
 _MONTH_MAP = {
     "January": 1, "February": 2, "March": 3, "April": 4,
@@ -17,6 +19,10 @@ def build_arrival_date(df: pd.DataFrame) -> pd.DataFrame:
       arrival_date_year, arrival_date_month (string name), arrival_date_day_of_month
     """
     df = df.copy()
+    if "arrival_date" in df.columns:
+        df["arrival_date"] = pd.to_datetime(df["arrival_date"], errors="coerce")
+        return df
+
     month_num = df["arrival_date_month"].map(_MONTH_MAP)
     df["arrival_date"] = pd.to_datetime({
         "year": df["arrival_date_year"],
@@ -35,11 +41,31 @@ def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
       daily_bookings      : count of all bookings
       daily_cancellations : count of canceled bookings
     """
-    grouped = df.groupby("arrival_date").agg(
-        daily_revenue=("revenue", "sum"),
-        daily_bookings=("hotel", "count"),
-        daily_cancellations=("is_canceled", "sum"),
-    )
+    df = ensure_revenue_columns(df)
+
+    aggregations = {
+        "daily_booked_revenue": ("booked_revenue", "sum"),
+        "daily_realized_revenue": ("realized_revenue", "sum"),
+        "daily_cancellations": ("is_canceled", "sum"),
+    }
+    if "expected_realized_revenue" in df.columns:
+        aggregations["daily_expected_realized_revenue"] = ("expected_realized_revenue", "sum")
+
+    grouped = df.groupby("arrival_date").agg(**aggregations)
+    grouped["daily_bookings"] = df.groupby("arrival_date").size()
+    if "daily_expected_realized_revenue" not in grouped.columns:
+        grouped["daily_expected_realized_revenue"] = grouped["daily_realized_revenue"]
+    grouped["daily_revenue"] = grouped["daily_booked_revenue"]
+    grouped = grouped[
+        [
+            "daily_booked_revenue",
+            "daily_realized_revenue",
+            "daily_expected_realized_revenue",
+            "daily_revenue",
+            "daily_bookings",
+            "daily_cancellations",
+        ]
+    ]
     # Fill gaps so lag features and SARIMA differencing are not corrupted
     full_range = pd.date_range(grouped.index.min(), grouped.index.max(), freq="D")
     grouped = grouped.reindex(full_range, fill_value=0)

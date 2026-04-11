@@ -7,12 +7,16 @@ risk tier, and optional SHAP-based top risk factors per booking.
 import numpy as np
 import pandas as pd
 from src.preprocessing import drop_leaky_features, encode_categoricals
+from src.cancellation_evaluation import _align_to_feature_columns
 
 
 def score_bookings(
     bookings_df: pd.DataFrame,
     cancellation_model,
     shap_explainer=None,
+    feature_columns: list | None = None,
+    label_encoders: dict | None = None,
+    feature_defaults: dict | None = None,
 ) -> pd.DataFrame:
     """
     Add cancel_probability, risk_tier, and optionally top_risk_factors to each booking.
@@ -31,12 +35,26 @@ def score_bookings(
         top_risk_factors (list of dicts, only if shap_explainer provided)
     """
     df = bookings_df.copy()
-    X, _, _ = encode_categoricals(drop_leaky_features(df))
+    if feature_columns is not None:
+        X_vals = _align_to_feature_columns(
+            drop_leaky_features(df),
+            feature_columns,
+            label_encoders or {},
+            feature_defaults or {},
+        )
+        X_for_model = X_vals
+        shap_feature_names = list(feature_columns)
+        shap_feature_values = pd.DataFrame(X_vals, columns=shap_feature_names)
+    else:
+        X, _, _ = encode_categoricals(drop_leaky_features(df))
+        X_for_model = X.values
+        shap_feature_names = list(X.columns)
+        shap_feature_values = X
 
     if hasattr(cancellation_model, "predict_proba"):
-        proba = cancellation_model.predict_proba(X.values)[:, 1]
+        proba = cancellation_model.predict_proba(X_for_model)[:, 1]
     else:
-        proba = cancellation_model.predict(X.values).astype(float)
+        proba = cancellation_model.predict(X_for_model).astype(float)
 
     df = df.copy()
     df["cancel_probability"] = proba
@@ -47,17 +65,16 @@ def score_bookings(
     )
 
     if shap_explainer is not None:
-        shap_values = shap_explainer.shap_values(X.values)
+        shap_values = shap_explainer.shap_values(X_for_model)
         if isinstance(shap_values, list):
             shap_values = shap_values[1]
-        feature_names = list(X.columns)
         risk_factors = []
         for i, row_shap in enumerate(shap_values):
             top_idx = np.argsort(np.abs(row_shap))[-3:][::-1]
             factors = [
                 {
-                    "feature": feature_names[j],
-                    "value": float(X.iloc[i, j]),
+                    "feature": shap_feature_names[j],
+                    "value": float(shap_feature_values.iloc[i, j]),
                     "impact": f"{row_shap[j]:+.2f}",
                 }
                 for j in top_idx

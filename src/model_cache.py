@@ -14,6 +14,8 @@ MODELS_DIR = Path("models")
 
 _PATHS: dict[str, str] = {
     "xgb_revenue":      "xgb_revenue_forecaster.pkl",
+    "xgb_realized_revenue": "xgb_realized_revenue_forecaster.pkl",
+    "xgb_expected_revenue": "xgb_expected_revenue_forecaster.pkl",
     "sarima_revenue":   "sarima_revenue_result.pkl",
     "xgb_demand":       "xgb_demand_forecaster.pkl",
     "sarima_demand":    "sarima_demand_result.pkl",
@@ -24,6 +26,8 @@ _PATHS: dict[str, str] = {
     "eval_metrics":     "eval_metrics.pkl",
     "selected_features":  "selected_features.pkl",
     "prophet_revenue":    "prophet_revenue_model.pkl",
+    "prophet_realized_revenue": "prophet_realized_revenue_model.pkl",
+    "prophet_expected_revenue": "prophet_expected_revenue_model.pkl",
     "prophet_demand":     "prophet_demand_model.pkl",
 }
 

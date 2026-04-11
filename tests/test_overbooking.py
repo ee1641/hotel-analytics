@@ -40,7 +40,14 @@ def _patched_score(proba: float, n: int):
 @pytest.fixture(autouse=True)
 def patch_score_bookings(monkeypatch):
     """Patch score_bookings so overbooking tests don't need a full ML stack."""
-    def _fake_score(bookings_df, model, shap_explainer=None):
+    def _fake_score(
+        bookings_df,
+        model,
+        shap_explainer=None,
+        feature_columns=None,
+        label_encoders=None,
+        feature_defaults=None,
+    ):
         n = len(bookings_df)
         proba = float(model.predict_proba(np.zeros((n, 1)))[:, 1].mean())
         return _patched_score(proba, n)
@@ -100,3 +107,33 @@ def test_no_matching_date_returns_zeros():
     # Use a date with no bookings
     rec = calculate_overbooking_recommendation(df, _make_model(), date(2025, 12, 31), 100)
     assert rec["recommended_overbooks"] == 0
+
+
+def test_overbooking_passes_saved_feature_schema(monkeypatch):
+    captured = {}
+
+    def fake_score(bookings_df, model, shap_explainer=None, feature_columns=None, label_encoders=None, feature_defaults=None):
+        captured["feature_columns"] = feature_columns
+        captured["label_encoders"] = label_encoders
+        captured["feature_defaults"] = feature_defaults
+        return _patched_score(0.5, len(bookings_df))
+
+    import src.overbooking as _mod
+    monkeypatch.setattr(_mod, "score_bookings", fake_score)
+
+    from src.overbooking import calculate_overbooking_recommendation
+    df = _make_bookings(5)
+    rec = calculate_overbooking_recommendation(
+        df,
+        _make_model(0.5),
+        date(2024, 1, 15),
+        100,
+        feature_columns=["lead_time", "adr"],
+        label_encoders={"market_segment": object()},
+        feature_defaults={"lead_time": 0.0, "adr": 0.0},
+    )
+
+    assert rec["expected_cancellations"] > 0
+    assert captured["feature_columns"] == ["lead_time", "adr"]
+    assert "market_segment" in captured["label_encoders"]
+    assert captured["feature_defaults"]["adr"] == 0.0

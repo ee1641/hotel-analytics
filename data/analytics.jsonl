@@ -1,3 +1,11 @@
 {"timestamp": "2026-04-10T09:24:40.397558", "event_type": "page_view", "page": "landing", "data": {}}
 {"timestamp": "2026-04-10T09:27:05.124749", "event_type": "page_view", "page": "landing", "data": {}}
 {"timestamp": "2026-04-10T09:27:05.146980", "event_type": "button_click", "page": "landing", "data": {"button": "try_demo"}}
+{"timestamp": "2026-04-10T15:16:16.444309", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T22:04:02.643523", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T22:04:15.626545", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T22:05:52.665624", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T22:57:40.665008", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T23:16:43.064305", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T23:16:57.152398", "event_type": "page_view", "page": "landing", "data": {}}
+{"timestamp": "2026-04-10T23:27:41.043814", "event_type": "page_view", "page": "landing", "data": {}}

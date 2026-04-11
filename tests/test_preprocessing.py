@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from src.preprocessing import (
     load_data, clean_data, engineer_features, encode_categoricals,
-    drop_leaky_features, LEAKY_COLUMNS,
+    drop_leaky_features, LEAKY_COLUMNS, remove_accidental_duplicate_bookings,
 )
 
 DATA_PATH = "hotel_bookings.csv"
@@ -40,6 +40,34 @@ def test_no_null_agent(clean_df):
 
 def test_no_null_children(clean_df):
     assert clean_df["children"].isna().sum() == 0
+
+
+def test_exact_duplicate_rows_removed():
+    df = pd.DataFrame(
+        [
+            {"arrival_date": "2024-01-01", "is_canceled": 0, "adr": 100.0},
+            {"arrival_date": "2024-01-01", "is_canceled": 0, "adr": 100.0},
+            {"arrival_date": "2024-01-02", "is_canceled": 1, "adr": 120.0},
+        ]
+    )
+
+    deduped = remove_accidental_duplicate_bookings(df)
+
+    assert len(deduped) == 2
+
+
+def test_clean_data_removes_exact_duplicates():
+    df = pd.DataFrame(
+        [
+            {"arrival_date": "2024-01-01", "is_canceled": 0, "adr": 100.0, "agent": None, "company": None, "country": None, "children": None},
+            {"arrival_date": "2024-01-01", "is_canceled": 0, "adr": 100.0, "agent": None, "company": None, "country": None, "children": None},
+            {"arrival_date": "2024-01-02", "is_canceled": 1, "adr": 120.0, "agent": None, "company": None, "country": None, "children": None},
+        ]
+    )
+
+    cleaned = clean_data(df)
+
+    assert len(cleaned) == 2
 
 
 def test_total_nights(engineered_df):

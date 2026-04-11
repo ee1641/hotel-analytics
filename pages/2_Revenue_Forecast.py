@@ -1,5 +1,5 @@
 """
-Page 2 — Revenue & Demand Forecast
+Page 2 - Revenue and Demand Forecast
 XGBoost vs Prophet vs naive baseline, metrics, cross-validation table.
 """
 import warnings
@@ -15,76 +15,94 @@ from app import load_and_prepare_data, get_or_train_models
 from src.forecasting import forecast_xgb, forecast_prophet, naive_baseline_forecast
 
 st.set_page_config(page_title="Revenue Forecast", page_icon="📈", layout="wide")
-st.title("📈 Revenue & Demand Forecast")
-st.caption(
-    "Revenue and demand figures are aggregated by **arrival date**. "
-    "Multi-night stays are not spread across stay nights."
-)
+st.title("📈 Revenue and Demand Forecast")
 
 try:
-    with st.spinner("Loading models..."):
-        _, daily_df = load_and_prepare_data()
-        models = get_or_train_models()
+    _, daily_df = load_and_prepare_data()
+    models = get_or_train_models()
     eval_metrics = models["eval_metrics"]
 except Exception as e:
     st.error(f"Failed to load data or models: {e}")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Controls
-# ---------------------------------------------------------------------------
+daily_df = models.get("daily_revenue_views", daily_df)
+
 col_ctrl1, col_ctrl2 = st.columns(2)
 with col_ctrl1:
     series_choice = st.radio("Series", ["Revenue", "Demand"], horizontal=True)
 with col_ctrl2:
     model_choice = st.radio("Forecast Model", ["XGBoost", "Prophet", "Naive Baseline"], horizontal=True)
 
-# ---------------------------------------------------------------------------
-# Resolve series + model keys
-# ---------------------------------------------------------------------------
 if series_choice == "Revenue":
-    series = daily_df["daily_revenue"]
-    y_label = "Revenue (€)"
-    xgb_key, prophet_key = "xgb_revenue", "prophet_revenue"
-    xgb_metric_key, prophet_metric_key, naive_key = "revenue_xgb", "revenue_prophet", "revenue_naive"
+    revenue_type = st.radio(
+        "Revenue Type",
+        ["Booked Revenue", "Realized Revenue", "Expected Realized Revenue"],
+        horizontal=True,
+    )
+    revenue_config = {
+        "Booked Revenue": {
+            "column": "daily_booked_revenue",
+            "label": "Booked Revenue (€)",
+            "xgb_key": "xgb_revenue",
+            "prophet_key": "prophet_revenue",
+            "metrics": ("revenue_booked_xgb", "revenue_booked_prophet", "revenue_booked_naive"),
+        },
+        "Realized Revenue": {
+            "column": "daily_realized_revenue",
+            "label": "Realized Revenue (€)",
+            "xgb_key": "xgb_realized_revenue",
+            "prophet_key": "prophet_realized_revenue",
+            "metrics": ("revenue_realized_xgb", "revenue_realized_prophet", "revenue_realized_naive"),
+        },
+        "Expected Realized Revenue": {
+            "column": "daily_expected_realized_revenue",
+            "label": "Expected Realized Revenue (€)",
+            "xgb_key": "xgb_expected_revenue",
+            "prophet_key": "prophet_expected_revenue",
+            "metrics": ("revenue_expected_xgb", "revenue_expected_prophet", "revenue_expected_naive"),
+        },
+    }[revenue_type]
+
+    series = daily_df[revenue_config["column"]]
+    y_label = revenue_config["label"]
+    xgb_key = revenue_config["xgb_key"]
+    prophet_key = revenue_config["prophet_key"]
+    xgb_metric_key, prophet_metric_key, naive_key = revenue_config["metrics"]
+    forecast_title = f"30-Day {revenue_type} Forecast"
 else:
     series = daily_df["daily_bookings"]
     y_label = "Bookings"
     xgb_key, prophet_key = "xgb_demand", "prophet_demand"
     xgb_metric_key, prophet_metric_key, naive_key = "demand_xgb", "demand_prophet", "demand_naive"
+    forecast_title = "30-Day Demand Forecast"
 
 xgb_model, feat_cols = models[xgb_key]
 prophet_model = models[prophet_key]
 
-# ---------------------------------------------------------------------------
-# Metrics row
-# ---------------------------------------------------------------------------
 st.subheader("Model Performance — Held-Out Test Set (Last 30 Days, Unseen During Training)")
-m_xgb     = eval_metrics[xgb_metric_key]
+m_xgb = eval_metrics[xgb_metric_key]
 m_prophet = eval_metrics.get(prophet_metric_key, {})
-m_naive   = eval_metrics[naive_key]
+m_naive = eval_metrics[naive_key]
 
 metric_cols = st.columns(3)
 with metric_cols[0]:
     st.markdown("**XGBoost**")
-    st.metric("MAE",  f"{m_xgb['mae']:,.1f}")
+    st.metric("MAE", f"{m_xgb['mae']:,.1f}")
     st.metric("MAPE", f"{m_xgb['mape']:.1f}%")
 with metric_cols[1]:
     st.markdown("**Prophet**")
-    st.metric("MAE",  f"{m_prophet.get('mae', 0):,.1f}")
+    st.metric("MAE", f"{m_prophet.get('mae', 0):,.1f}")
     st.metric("MAPE", f"{m_prophet.get('mape', 0):.1f}%")
 with metric_cols[2]:
     st.markdown("**Naive Baseline**")
-    st.metric("MAE",  f"{m_naive['mae']:,.1f}")
+    st.metric("MAE", f"{m_naive['mae']:,.1f}")
     st.metric("MAPE", f"{m_naive['mape']:.1f}%")
-
 st.info(
-    "**Evaluation methodology:** Evaluation models are trained on all data except the final 30 days. "
+    "**Evaluation methodology:** Models are trained on all data except the final 30 days. "
     "Metrics above are computed on those 30 days (never seen during training). "
-    "The production forecast below uses models retrained on the full dataset."
+    "The production forecast uses models retrained on the full dataset."
 )
 
-# Improvement callout
 if model_choice == "XGBoost":
     selected_mape = m_xgb["mape"]
 elif model_choice == "Prophet":
@@ -101,10 +119,7 @@ if model_choice != "Naive Baseline":
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Forecast chart — last 90 days + 30-day forecast + optional confidence band
-# ---------------------------------------------------------------------------
-st.subheader(f"30-Day {series_choice} Forecast")
+st.subheader(forecast_title)
 history_window = series.iloc[-90:]
 
 show_ci = False
@@ -153,9 +168,6 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Forecast table
-# ---------------------------------------------------------------------------
 with st.expander("View 30-Day Forecast Data"):
     forecast_df = pd.DataFrame({
         "Date": forecast_30.index.date,
@@ -164,10 +176,7 @@ with st.expander("View 30-Day Forecast Data"):
     })
     st.dataframe(forecast_df, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Cross-validation table (revenue only)
-# ---------------------------------------------------------------------------
-with st.expander("Cross-Validation Detail (Revenue, XGBoost, expanding window)"):
+with st.expander("Cross-Validation Detail (Booked Revenue, XGBoost, expanding window)"):
     cv_df = eval_metrics.get("cv_scores")
     if cv_df is not None and len(cv_df) > 0:
         st.dataframe(cv_df, use_container_width=True)

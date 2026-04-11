@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from api.auth import verify_api_key, check_hotel_ownership
+from src.data_context import resolve_hotel_dataset_context
 
 router = APIRouter(prefix="/hotels/{hotel_id}", tags=["cancellations"])
 
@@ -32,14 +33,19 @@ def predict_cancellation(
     check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         import pandas as pd
-        from src.services import get_or_train_models
+        from app import get_or_train_models
         from src.preprocessing import drop_leaky_features, encode_categoricals
-        models = get_or_train_models()
+        context = resolve_hotel_dataset_context(hotel_id)
+        models = get_or_train_models(dataset_context=context)
         df = pd.DataFrame([booking.model_dump()])
         X, _, _ = encode_categoricals(drop_leaky_features(df))
         model = models["cancel_models"]["xgboost"]
         proba = float(model.predict_proba(X.values)[0][1])
         risk = "High" if proba > 0.6 else ("Medium" if proba > 0.3 else "Low")
         return {"status": "ok", "data": {"cancel_probability": round(proba, 4), "risk_tier": risk}}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

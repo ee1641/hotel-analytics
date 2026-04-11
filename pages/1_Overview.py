@@ -1,6 +1,6 @@
 """
-Page 1 — Overview Dashboard
-KPIs, revenue & bookings over time, hotel/date filters.
+Page 1 - Overview Dashboard
+KPIs, revenue and bookings over time, hotel/date filters.
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -28,9 +28,9 @@ except Exception as e:
     st.error(f"Failed to load data or models: {e}")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Sidebar filters
-# ---------------------------------------------------------------------------
+df = models.get("df_with_expected_revenue", df)
+daily_df = models.get("daily_revenue_views", daily_df)
+
 st.sidebar.header("Filters")
 
 hotel_options = ["All"] + sorted(df["hotel"].dropna().unique().tolist())
@@ -45,9 +45,6 @@ date_range = st.sidebar.date_input(
     max_value=date_max,
 )
 
-# ---------------------------------------------------------------------------
-# Apply filters
-# ---------------------------------------------------------------------------
 df_filtered = df.copy()
 if selected_hotel != "All":
     df_filtered = df_filtered[df_filtered["hotel"] == selected_hotel]
@@ -63,40 +60,46 @@ if len(date_range) == 2:
 else:
     daily_filtered = daily_df.copy()
 
-# ---------------------------------------------------------------------------
-# KPI row
-# ---------------------------------------------------------------------------
-total_revenue   = daily_filtered["daily_revenue"].sum()
-avg_rev         = daily_filtered["daily_revenue"].mean()
-total_bookings  = int(daily_filtered["daily_bookings"].sum())
-cancel_rate     = df_filtered["is_canceled"].mean() if len(df_filtered) > 0 else 0.0
+booked_revenue = daily_filtered["daily_booked_revenue"].sum()
+realized_revenue = daily_filtered["daily_realized_revenue"].sum()
+expected_realized_revenue = daily_filtered["daily_expected_realized_revenue"].sum()
+total_bookings = int(daily_filtered["daily_bookings"].sum())
+cancel_rate = df_filtered["is_canceled"].mean() if len(df_filtered) > 0 else 0.0
+revenue_gap = booked_revenue - realized_revenue
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Revenue",      f"€{total_revenue:,.0f}")
-col2.metric("Avg Daily Revenue",  f"€{avg_rev:,.0f}")
-col3.metric("Total Bookings",     f"{total_bookings:,}")
-col4.metric("Cancellation Rate",  f"{cancel_rate:.1%}")
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1.metric("Booked Revenue", f"€{booked_revenue:,.0f}")
+col2.metric("Realized Revenue", f"€{realized_revenue:,.0f}")
+col3.metric("Expected Realized", f"€{expected_realized_revenue:,.0f}")
+col4.metric("Revenue Lost", f"€{revenue_gap:,.0f}")
+col5.metric("Total Bookings", f"{total_bookings:,}")
+col6.metric("Cancellation Rate", f"{cancel_rate:.1%}")
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Revenue over time
-# ---------------------------------------------------------------------------
-st.subheader("Booked Revenue by Arrival Date")
+st.subheader("Daily Revenue Over Time")
+revenue_plot_df = daily_filtered.reset_index().rename(
+    columns={
+        "daily_booked_revenue": "Booked Revenue",
+        "daily_realized_revenue": "Realized Revenue",
+        "daily_expected_realized_revenue": "Expected Realized Revenue",
+    }
+)
 fig_rev = px.line(
-    daily_filtered.reset_index(),
+    revenue_plot_df,
     x="arrival_date",
-    y="daily_revenue",
-    labels={"arrival_date": "Date", "daily_revenue": "Revenue (€)"},
-    color_discrete_sequence=["steelblue"],
+    y=["Booked Revenue", "Realized Revenue", "Expected Realized Revenue"],
+    labels={"arrival_date": "Date", "value": "Revenue (€)", "variable": "Revenue Type"},
+    color_discrete_map={
+        "Booked Revenue": "steelblue",
+        "Realized Revenue": "seagreen",
+        "Expected Realized Revenue": "darkorange",
+    },
 )
 fig_rev.update_layout(hovermode="x unified", height=350)
 st.plotly_chart(fig_rev, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Bookings over time
-# ---------------------------------------------------------------------------
-st.subheader("Booking Arrivals per Day")
+st.subheader("Daily Bookings Over Time")
 fig_bk = px.line(
     daily_filtered.reset_index(),
     x="arrival_date",
@@ -107,9 +110,6 @@ fig_bk = px.line(
 fig_bk.update_layout(hovermode="x unified", height=350)
 st.plotly_chart(fig_bk, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Cancellations heatmap by month
-# ---------------------------------------------------------------------------
 st.subheader("Monthly Cancellation Breakdown")
 if len(df_filtered) > 0:
     df_filtered = df_filtered.copy()
@@ -133,9 +133,6 @@ if len(df_filtered) > 0:
     fig_m.update_coloraxes(showscale=False)
     st.plotly_chart(fig_m, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Quick insight
-# ---------------------------------------------------------------------------
 if cancel_rate > 0.40:
     st.warning(f"High cancellation rate detected: **{cancel_rate:.1%}**. Consider reviewing deposit policies.")
 elif cancel_rate > 0.30:
@@ -143,9 +140,12 @@ elif cancel_rate > 0.30:
 else:
     st.success(f"Cancellation rate is healthy: **{cancel_rate:.1%}**.")
 
-# ---------------------------------------------------------------------------
-# Cross-dataset validation (generalization to INN Hotels dataset)
-# ---------------------------------------------------------------------------
+expected_capture = (expected_realized_revenue / booked_revenue) if booked_revenue else 0.0
+st.caption(
+    f"Booked revenue includes all bookings. Realized revenue excludes cancellations. "
+    f"Expected realized revenue applies cancellation-risk estimates and currently captures **{expected_capture:.1%}** of booked revenue."
+)
+
 cross = models["eval_metrics"].get("cross_dataset", {})
 if cross:
     with st.expander("Cross-Dataset Validation (INN Hotels Group dataset)"):
@@ -168,39 +168,3 @@ if cross:
             )
         else:
             st.info("Cross-dataset evaluation results not available.")
-
-# ---------------------------------------------------------------------------
-# PDF Export
-# ---------------------------------------------------------------------------
-st.divider()
-if st.button("Export Report (PDF)", type="secondary"):
-    try:
-        from fpdf import FPDF
-        import io
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "Hotel Analytics — Summary Report", ln=True)
-        pdf.set_font("Helvetica", "", 11)
-        pdf.ln(4)
-        pdf.cell(0, 8, f"Date range: {date_min} to {date_max}", ln=True)
-        pdf.cell(0, 8, f"Hotel filter: {selected_hotel}", ln=True)
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "Key Metrics", ln=True)
-        pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 8, f"  Total Revenue:       EUR {total_rev:,.0f}", ln=True)
-        pdf.cell(0, 8, f"  Avg Daily Revenue:   EUR {avg_daily_rev:,.0f}", ln=True)
-        pdf.cell(0, 8, f"  Total Bookings:      {total_bookings:,}", ln=True)
-        pdf.cell(0, 8, f"  Cancellation Rate:   {cancel_rate:.1%}", ln=True)
-
-        pdf_bytes = pdf.output()
-        st.download_button(
-            label="Download PDF",
-            data=bytes(pdf_bytes),
-            file_name="hotel_analytics_report.pdf",
-            mime="application/pdf",
-        )
-    except Exception as e:
-        st.error(f"PDF generation failed: {e}")

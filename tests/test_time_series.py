@@ -24,6 +24,9 @@ def test_aggregate_has_required_columns(df):
     dated = build_arrival_date(df)
     daily = aggregate_daily(dated)
     assert "daily_revenue" in daily.columns
+    assert "daily_booked_revenue" in daily.columns
+    assert "daily_realized_revenue" in daily.columns
+    assert "daily_expected_realized_revenue" in daily.columns
     assert "daily_bookings" in daily.columns
     assert "daily_cancellations" in daily.columns
 
@@ -51,3 +54,62 @@ def test_daily_revenue_non_negative(df):
     dated = build_arrival_date(df)
     daily = aggregate_daily(dated)
     assert (daily["daily_revenue"] >= 0).all()
+
+
+def test_booked_revenue_alias_matches_daily_revenue(df):
+    dated = build_arrival_date(df)
+    daily = aggregate_daily(dated)
+    assert daily["daily_revenue"].equals(daily["daily_booked_revenue"])
+
+
+def test_expected_realized_defaults_to_realized_when_missing(df):
+    dated = build_arrival_date(df)
+    daily = aggregate_daily(dated)
+    assert daily["daily_expected_realized_revenue"].equals(daily["daily_realized_revenue"])
+
+
+def test_aggregate_daily_recovers_missing_split_revenue_columns():
+    df = pd.DataFrame(
+        {
+            "arrival_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "revenue": [100.0, 120.0],
+            "is_canceled": [0, 1],
+            "stays_in_weekend_nights": [1, 1],
+            "stays_in_week_nights": [1, 1],
+            "adr": [50.0, 60.0],
+        }
+    )
+
+    daily = aggregate_daily(df)
+
+    assert daily.loc[pd.Timestamp("2024-01-01"), "daily_booked_revenue"] == 100.0
+    assert daily.loc[pd.Timestamp("2024-01-01"), "daily_realized_revenue"] == 100.0
+    assert daily.loc[pd.Timestamp("2024-01-02"), "daily_realized_revenue"] == 0.0
+
+
+def test_duplicate_rows_do_not_inflate_daily_metrics():
+    df = pd.DataFrame(
+        {
+            "arrival_date": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-02"]),
+            "is_canceled": [0, 0, 1],
+            "adr": [50.0, 50.0, 60.0],
+            "stays_in_weekend_nights": [1, 1, 1],
+            "stays_in_week_nights": [1, 1, 1],
+            "agent": [0, 0, 0],
+            "company": [0, 0, 0],
+            "country": ["PRT", "PRT", "GBR"],
+            "children": [0, 0, 0],
+            "babies": [0, 0, 0],
+            "adults": [2, 2, 2],
+        }
+    )
+
+    from src.preprocessing import clean_data, engineer_features
+
+    cleaned = clean_data(df)
+    engineered = engineer_features(cleaned)
+    daily = aggregate_daily(engineered)
+
+    assert len(cleaned) == 2
+    assert daily.loc[pd.Timestamp("2024-01-01"), "daily_bookings"] == 1
+    assert daily.loc[pd.Timestamp("2024-01-01"), "daily_booked_revenue"] == 100.0

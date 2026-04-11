@@ -20,6 +20,9 @@ def calculate_overbooking_recommendation(
     overbooking_cost: float = 150.0,
     empty_room_cost: float = 100.0,
     confidence_level: float = 0.80,
+    feature_columns: list | None = None,
+    label_encoders: dict | None = None,
+    feature_defaults: dict | None = None,
 ) -> dict:
     """
     Recommend how many rooms to overbook for target_date.
@@ -63,7 +66,13 @@ def calculate_overbooking_recommendation(
         }
 
     # Get cancel probabilities for each booking
-    scored = score_bookings(day_bookings, cancellation_model)
+    scored = score_bookings(
+        day_bookings,
+        cancellation_model,
+        feature_columns=feature_columns,
+        label_encoders=label_encoders,
+        feature_defaults=feature_defaults,
+    )
     probs = scored["cancel_probability"].values
 
     # Expected cancellations (mean of Poisson = sum of individual probabilities)
