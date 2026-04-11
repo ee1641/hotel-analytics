@@ -1,6 +1,7 @@
 """
-Page 6 — Overbooking Recommendation Engine
+Page 6 — Overbooking Simulator
 Date selector + cost inputs → optimal overbook count + risk table.
+This is a historical simulation prototype, not a live decision engine.
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -14,11 +15,17 @@ from app import load_and_prepare_data, get_or_train_models
 from src.overbooking import calculate_overbooking_recommendation
 from src.booking_risk_scorer import score_bookings
 
-st.set_page_config(page_title="Overbooking", page_icon="🏨", layout="wide")
-st.title("🏨 Overbooking Recommendation Engine")
+st.set_page_config(page_title="Overbooking Simulator", page_icon="🏨", layout="wide")
+st.title("🏨 Overbooking Simulator")
 st.markdown(
-    "Use your cancellation model to find the optimal number of rooms to overbook "
-    "for any arrival date — balancing walk costs against lost revenue from no-shows."
+    "Estimate the optimal number of rooms to overbook for any arrival date in the "
+    "historical dataset — balancing walk costs against lost revenue from cancellations."
+)
+st.warning(
+    "**Prototype disclaimer:** This is a decision-support simulation based on historical "
+    "booking patterns (2015–2017). It uses the cancellation model to score past bookings "
+    "on a chosen arrival date. In a production system, this would score active future "
+    "bookings before their arrival date. Results should not be used for real operational decisions."
 )
 
 try:
