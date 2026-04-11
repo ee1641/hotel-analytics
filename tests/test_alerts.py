@@ -156,6 +156,53 @@ def test_format_alert_email_empty_list():
     assert "No alerts" in html
 
 
+def test_alerts_anchor_to_dataset_max_date():
+    """Alerts use the dataset's max arrival_date as 'today', not the system clock."""
+    past_today = pd.Timestamp("2015-08-01")
+    df = pd.DataFrame({
+        "arrival_date": [past_today + pd.Timedelta(days=i % 5) for i in range(20)],
+        "is_canceled":  [0] * 20,
+        "adr":          [100.0] * 20,
+        "lead_time":    [10] * 20,
+        "adults":       [2] * 20,
+    })
+    max_date = df["arrival_date"].max()
+    idx = pd.date_range(start=max_date, periods=60, freq="D")
+    forecast = pd.Series([5.0] * 60, index=idx)  # low → triggers low_occupancy
+
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 20})
+        alerts = generate_daily_alerts(df, forecast, MagicMock(), {"total_rooms": 100})
+
+    types = [a.type for a in alerts]
+    assert "low_occupancy" in types, (
+        "Expected low_occupancy alert for historical dataset — "
+        "alerts must be anchored to dataset max date, not system date."
+    )
+
+
+def test_demand_dip_alert_type_not_revenue_dip():
+    """The demand-dip alert must use type='demand_dip', not 'revenue_dip'."""
+    df = _make_bookings()
+    # Bookings anchor today to max(arrival_date) = system today + 4 days.
+    # Build forecast starting from system today so days 0-4 of forecast are within range.
+    # Use high background (100) with very low values in first few days so they fall below 25th pct.
+    idx = pd.date_range(start=pd.Timestamp.today(), periods=60, freq="D")
+    vals = [100.0] * 60
+    vals[0] = 1.0
+    vals[1] = 1.0
+    vals[2] = 1.0
+    forecast = pd.Series(vals, index=idx)  # low days in first week → triggers demand_dip
+
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 20})
+        alerts = generate_daily_alerts(df, forecast, MagicMock(), {})
+
+    alert_types = [a.type for a in alerts]
+    assert "revenue_dip" not in alert_types, "Alert type must not be 'revenue_dip'"
+    assert "demand_dip" in alert_types, "Alert type must be 'demand_dip'"
+
+
 def test_format_alert_email_all_severities():
     from src.email_alerts import format_alert_email
     alerts = [

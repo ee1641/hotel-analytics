@@ -54,7 +54,9 @@ def generate_daily_alerts(
     list[Alert] sorted critical → warning → info
     """
     alerts: list[Alert] = []
-    today = datetime.today().date()
+    # Anchor to the dataset's own date range so alerts work on historical demo data.
+    # In a live system with real-time data, this naturally resolves to "today".
+    today = bookings_df["arrival_date"].max().date()
     cfg = {
         "cancel_risk_threshold": 0.7,
         "demand_spike_percentile": 90,
@@ -134,11 +136,11 @@ def generate_daily_alerts(
         dip_days = next_7[next_7 < threshold_25]
         if len(dip_days) > 0:
             alerts.append(Alert(
-                type="revenue_dip",
+                type="demand_dip",
                 severity="warning",
-                title=f"Revenue Dip: {len(dip_days)} Low-Demand Day(s) This Week",
+                title=f"Demand Dip: {len(dip_days)} Low-Arrival Day(s) This Week",
                 description=(
-                    f"Forecasted demand is below the 25th percentile on "
+                    f"Forecasted arrival demand is below the 25th percentile on "
                     f"{len(dip_days)} day(s) in the next 7 days."
                 ),
                 recommended_action=(
