@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app import load_and_prepare_data, get_or_train_models
 from src.forecasting import forecast_xgb, naive_baseline_forecast
 from src.analytics import estimate_staffing
+from src.time_series import expand_stay_nights, aggregate_stay_nights
 
 st.set_page_config(page_title="Demand & Staffing", page_icon="👥", layout="wide")
 st.title("👥 Demand & Staffing Planner")
@@ -23,7 +24,7 @@ st.caption(
 )
 
 try:
-    _, daily_df = load_and_prepare_data()
+    df, daily_df = load_and_prepare_data()
     models = get_or_train_models()
 except Exception as e:
     st.error(f"Failed to load data or models: {e}")
@@ -126,3 +127,53 @@ with st.expander("Model Info"):
         f"**MAE (held-out 20%):** {m.get('mae', 'N/A'):,.1f} bookings  \n"
         f"**MAPE:** {m.get('mape', 'N/A'):.1f}%"
     )
+
+# ---------------------------------------------------------------------------
+# Stay-night occupancy view
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Occupied Rooms by Stay Night")
+st.caption(
+    "Each non-cancelled booking is expanded across all its nights of stay. "
+    "Occupied rooms = actual room-nights in use, not just arrival counts."
+)
+
+try:
+    stay_df = expand_stay_nights(df)
+    occ_df = aggregate_stay_nights(stay_df)
+    occ_hist = occ_df.iloc[-90:] if len(occ_df) >= 90 else occ_df
+
+    occ_col1, occ_col2 = st.columns(2)
+    occ_col1.metric("Avg Occupied Rooms/Night (hist.)", f"{occ_hist['occupied_rooms'].mean():.1f}")
+    occ_col2.metric("Peak Occupied Rooms", f"{int(occ_hist['occupied_rooms'].max())}")
+
+    fig_occ = go.Figure()
+    fig_occ.add_trace(go.Bar(
+        x=occ_hist.index,
+        y=occ_hist["occupied_rooms"].values,
+        name="Occupied Rooms",
+        marker_color="mediumseagreen",
+        opacity=0.8,
+    ))
+    fig_occ.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Occupied Rooms",
+        height=380,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_occ, use_container_width=True)
+
+    st.markdown("**Staffing based on occupied rooms (historical)**")
+    occ_staff = occ_hist["occupied_rooms"].apply(
+        lambda r: estimate_staffing(r, guests_per_staff=guests_per_staff)
+    )
+    st.dataframe(
+        pd.DataFrame({
+            "Date": occ_hist.index.date,
+            "Occupied Rooms": occ_hist["occupied_rooms"].values.astype(int),
+            "Staff Needed (occupied)": occ_staff.values,
+        }),
+        use_container_width=True,
+    )
+except Exception as exc:
+    st.warning(f"Could not compute stay-night occupancy: {exc}")
