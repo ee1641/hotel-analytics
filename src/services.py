@@ -6,6 +6,7 @@ No Streamlit dependencies here.
 import logging
 import os
 import warnings
+from pathlib import Path
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -36,7 +37,7 @@ DATA_PATH = "hotel_bookings.csv"
 log = logging.getLogger(__name__)
 
 
-def load_and_prepare_data(data_path: str = DATA_PATH):
+def load_and_prepare_data(data_path: str = DATA_PATH, *, dataset_context=None):
     """
     Full preprocessing pipeline (no Streamlit caching — callers add caching as needed).
 
@@ -44,6 +45,8 @@ def load_and_prepare_data(data_path: str = DATA_PATH):
       df       : booking-level DataFrame with all engineered columns
       daily_df : daily-aggregated DataFrame (revenue, bookings, cancellations)
     """
+    if dataset_context is not None:
+        data_path = dataset_context.data_path
     df = engineer_features(clean_data(load_data(data_path)))
     df = build_arrival_date(df)
     df = add_temporal_features(df)
@@ -51,7 +54,7 @@ def load_and_prepare_data(data_path: str = DATA_PATH):
     return df, daily_df
 
 
-def get_or_train_models(data_path: str = DATA_PATH):
+def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
     """
     Load cached ML artifacts from disk or train them fresh.
     No Streamlit progress indicators — uses logging instead.
@@ -61,6 +64,11 @@ def get_or_train_models(data_path: str = DATA_PATH):
       cancel_models, feature_columns, label_encoders,
       feature_defaults, selected_features, eval_metrics
     """
+    _models_dir = model_cache.MODELS_DIR
+    if dataset_context is not None:
+        data_path = dataset_context.data_path
+        _models_dir = Path(dataset_context.models_dir)
+
     df, daily_df = load_and_prepare_data(data_path)
     results = {}
 
@@ -70,50 +78,50 @@ def get_or_train_models(data_path: str = DATA_PATH):
     # ------------------------------------------------------------------
     # Revenue forecasting (production models — trained on full data)
     # ------------------------------------------------------------------
-    if model_cache.artifact_exists("xgb_revenue"):
-        results["xgb_revenue"] = model_cache.load_artifact("xgb_revenue")
+    if model_cache.artifact_exists("xgb_revenue", models_dir=_models_dir):
+        results["xgb_revenue"] = model_cache.load_artifact("xgb_revenue", models_dir=_models_dir)
     else:
         log.info("Training XGBoost revenue forecaster...")
         xgb_m, xgb_cols = train_xgb_forecaster(rev_series, lags=[1, 7, 14, 30])
         results["xgb_revenue"] = (xgb_m, xgb_cols)
-        model_cache.save_artifact("xgb_revenue", (xgb_m, xgb_cols))
+        model_cache.save_artifact("xgb_revenue", (xgb_m, xgb_cols), models_dir=_models_dir)
 
-    if model_cache.artifact_exists("prophet_revenue"):
-        results["prophet_revenue"] = model_cache.load_artifact("prophet_revenue")
+    if model_cache.artifact_exists("prophet_revenue", models_dir=_models_dir):
+        results["prophet_revenue"] = model_cache.load_artifact("prophet_revenue", models_dir=_models_dir)
     else:
         log.info("Training Prophet revenue forecaster...")
         prophet_rev = train_prophet_forecaster(rev_series)
         results["prophet_revenue"] = prophet_rev
-        model_cache.save_artifact("prophet_revenue", prophet_rev)
+        model_cache.save_artifact("prophet_revenue", prophet_rev, models_dir=_models_dir)
 
     # ------------------------------------------------------------------
     # Demand forecasting (production models — trained on full data)
     # ------------------------------------------------------------------
-    if model_cache.artifact_exists("xgb_demand"):
-        results["xgb_demand"] = model_cache.load_artifact("xgb_demand")
+    if model_cache.artifact_exists("xgb_demand", models_dir=_models_dir):
+        results["xgb_demand"] = model_cache.load_artifact("xgb_demand", models_dir=_models_dir)
     else:
         log.info("Training XGBoost demand forecaster...")
         xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=[1, 7, 14, 30])
         results["xgb_demand"] = (xgb_d, xgb_d_cols)
-        model_cache.save_artifact("xgb_demand", (xgb_d, xgb_d_cols))
+        model_cache.save_artifact("xgb_demand", (xgb_d, xgb_d_cols), models_dir=_models_dir)
 
-    if model_cache.artifact_exists("prophet_demand"):
-        results["prophet_demand"] = model_cache.load_artifact("prophet_demand")
+    if model_cache.artifact_exists("prophet_demand", models_dir=_models_dir):
+        results["prophet_demand"] = model_cache.load_artifact("prophet_demand", models_dir=_models_dir)
     else:
         log.info("Training Prophet demand forecaster...")
         prophet_dem = train_prophet_forecaster(dem_series)
         results["prophet_demand"] = prophet_dem
-        model_cache.save_artifact("prophet_demand", prophet_dem)
+        model_cache.save_artifact("prophet_demand", prophet_dem, models_dir=_models_dir)
 
     # ------------------------------------------------------------------
     # Cancellation classification
     # ------------------------------------------------------------------
-    if model_cache.artifact_exists("cancel_models"):
-        results["cancel_models"] = model_cache.load_artifact("cancel_models")
-        results["feature_columns"] = model_cache.load_artifact("feature_columns")
-        results["label_encoders"] = model_cache.load_artifact("label_encoders")
-        results["feature_defaults"] = model_cache.load_artifact("feature_defaults")
-        results["selected_features"] = model_cache.load_artifact("selected_features") or []
+    if model_cache.artifact_exists("cancel_models", models_dir=_models_dir):
+        results["cancel_models"] = model_cache.load_artifact("cancel_models", models_dir=_models_dir)
+        results["feature_columns"] = model_cache.load_artifact("feature_columns", models_dir=_models_dir)
+        results["label_encoders"] = model_cache.load_artifact("label_encoders", models_dir=_models_dir)
+        results["feature_defaults"] = model_cache.load_artifact("feature_defaults", models_dir=_models_dir)
+        results["selected_features"] = model_cache.load_artifact("selected_features", models_dir=_models_dir) or []
     else:
         log.info("Training cancellation classifiers...")
         df_cancel = drop_leaky_features(df)
@@ -170,11 +178,11 @@ def get_or_train_models(data_path: str = DATA_PATH):
         results["label_encoders"] = label_encoders
         results["feature_defaults"] = feature_defaults
         results["selected_features"] = selected_features
-        model_cache.save_artifact("cancel_models", cancel_models)
-        model_cache.save_artifact("feature_columns", feature_columns)
-        model_cache.save_artifact("label_encoders", label_encoders)
-        model_cache.save_artifact("feature_defaults", feature_defaults)
-        model_cache.save_artifact("selected_features", selected_features)
+        model_cache.save_artifact("cancel_models", cancel_models, models_dir=_models_dir)
+        model_cache.save_artifact("feature_columns", feature_columns, models_dir=_models_dir)
+        model_cache.save_artifact("label_encoders", label_encoders, models_dir=_models_dir)
+        model_cache.save_artifact("feature_defaults", feature_defaults, models_dir=_models_dir)
+        model_cache.save_artifact("selected_features", selected_features, models_dir=_models_dir)
 
     # ------------------------------------------------------------------
     # Evaluation metrics — proper temporal holdout (1C fix)
@@ -183,8 +191,8 @@ def get_or_train_models(data_path: str = DATA_PATH):
     # Metrics are reported on the true last 30 days (never seen in training).
     # Production models above remain trained on all data for live forecasting.
     # ------------------------------------------------------------------
-    if model_cache.artifact_exists("eval_metrics"):
-        results["eval_metrics"] = model_cache.load_artifact("eval_metrics")
+    if model_cache.artifact_exists("eval_metrics", models_dir=_models_dir):
+        results["eval_metrics"] = model_cache.load_artifact("eval_metrics", models_dir=_models_dir)
     else:
         log.info("Computing evaluation metrics with temporal holdout (last 30 days unseen)...")
         TEST_DAYS = 30
@@ -250,6 +258,6 @@ def get_or_train_models(data_path: str = DATA_PATH):
             eval_metrics["cross_dataset"] = {}
 
         results["eval_metrics"] = eval_metrics
-        model_cache.save_artifact("eval_metrics", eval_metrics)
+        model_cache.save_artifact("eval_metrics", eval_metrics, models_dir=_models_dir)
 
     return results
