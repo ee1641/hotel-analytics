@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 from src.preprocessing import load_data, clean_data, engineer_features
-from src.time_series import build_arrival_date, aggregate_daily
+from src.time_series import build_arrival_date, aggregate_daily, expand_stay_nights, aggregate_stay_nights
 
 @pytest.fixture(scope="module")
 def df():
@@ -113,3 +113,61 @@ def test_duplicate_rows_do_not_inflate_daily_metrics():
     assert len(cleaned) == 2
     assert daily.loc[pd.Timestamp("2024-01-01"), "daily_bookings"] == 1
     assert daily.loc[pd.Timestamp("2024-01-01"), "daily_booked_revenue"] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Stay-night expansion tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_bookings_stay():
+    return pd.DataFrame({
+        "arrival_date": pd.to_datetime(["2023-01-01", "2023-01-02", "2023-01-01"]),
+        "total_nights": [2, 3, 1],
+        "adr": [100.0, 200.0, 50.0],
+        "is_canceled": [0, 0, 1],  # third booking cancelled — excluded
+    })
+
+
+def test_expand_stay_nights_excludes_cancelled(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    assert len(stay) == 5  # 2 + 3 nights only
+
+
+def test_expand_stay_nights_columns(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    assert set(stay.columns) >= {"date", "revenue_per_night"}
+
+
+def test_expand_stay_nights_dates(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    dates = sorted(stay["date"].dt.date.tolist())
+    expected = sorted([
+        pd.Timestamp("2023-01-01").date(),
+        pd.Timestamp("2023-01-02").date(),
+        pd.Timestamp("2023-01-02").date(),
+        pd.Timestamp("2023-01-03").date(),
+        pd.Timestamp("2023-01-04").date(),
+    ])
+    assert dates == expected
+
+
+def test_aggregate_stay_nights_columns(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    occ = aggregate_stay_nights(stay)
+    assert "occupied_rooms" in occ.columns
+    assert "daily_stay_revenue" in occ.columns
+
+
+def test_aggregate_stay_nights_no_gaps(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    occ = aggregate_stay_nights(stay)
+    expected_range = pd.date_range(occ.index.min(), occ.index.max(), freq="D")
+    assert len(occ) == len(expected_range)
+
+
+def test_aggregate_stay_nights_occupied_count(sample_bookings_stay):
+    stay = expand_stay_nights(sample_bookings_stay)
+    occ = aggregate_stay_nights(stay)
+    # 2023-01-02: both non-cancelled bookings overlap → 2 rooms occupied
+    assert occ.loc[pd.Timestamp("2023-01-02"), "occupied_rooms"] == 2
