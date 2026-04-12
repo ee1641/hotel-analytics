@@ -136,7 +136,7 @@ def test_hotel_forecast_route_uses_uploaded_dataset_context(client, hotel_and_ke
     assert not stale_model.exists()
     assert other_marker.exists()
 
-    import app as app_mod
+    import src.services as services_mod
 
     captured = {}
 
@@ -152,8 +152,8 @@ def test_hotel_forecast_route_uses_uploaded_dataset_context(client, hotel_and_ke
         captured["models_context"] = dataset_context
         return {"xgb_revenue": ("model", ["f1"]), "xgb_demand": ("model", ["f1"])}
 
-    monkeypatch.setattr(app_mod, "load_and_prepare_data", fake_load_and_prepare_data)
-    monkeypatch.setattr(app_mod, "get_or_train_models", fake_get_or_train_models)
+    monkeypatch.setattr(services_mod, "load_and_prepare_data", fake_load_and_prepare_data)
+    monkeypatch.setattr(services_mod, "get_or_train_models", fake_get_or_train_models)
 
     import src.forecasting as forecasting_mod
     monkeypatch.setattr(
@@ -197,9 +197,9 @@ def test_forecast_route_returns_400_for_tiny_uploaded_dataset(client, hotel_and_
     )
     assert upload_resp.status_code == 200
 
-    import app as app_mod
+    import src.services as services_mod
     monkeypatch.setattr(
-        app_mod,
+        services_mod,
         "load_and_prepare_data",
         lambda *args, **kwargs: (
             pd.DataFrame({"arrival_date": pd.to_datetime(["2024-01-01"])}),
@@ -210,7 +210,7 @@ def test_forecast_route_returns_400_for_tiny_uploaded_dataset(client, hotel_and_
         ),
     )
     monkeypatch.setattr(
-        app_mod,
+        services_mod,
         "get_or_train_models",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             ValueError("Dataset 'tiny_dataset' has only 1 valid daily revenue rows after preprocessing. Forecasting requires at least 31 daily observations.")
