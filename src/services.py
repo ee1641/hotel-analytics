@@ -36,6 +36,18 @@ from src.cancellation_evaluation import evaluate_cross_dataset
 DATA_PATH = "hotel_bookings.csv"
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configurable constants
+# Adjust these to match your hotel's region, tax regime, and operations.
+# ---------------------------------------------------------------------------
+APP_CONFIG = {
+    "tax_rate": 0.10,                # VAT / local tax rate applied to revenue
+    "cost_ratio": 0.60,              # Operational costs as fraction of revenue
+    "guests_per_staff_default": 10,  # Default guests per staff member
+    "timezone": "Europe/Lisbon",     # Hotel timezone (IANA tz string)
+    "currency_symbol": "€",
+}
+
 
 def load_and_prepare_data(data_path: str = DATA_PATH, *, dataset_context=None):
     """
