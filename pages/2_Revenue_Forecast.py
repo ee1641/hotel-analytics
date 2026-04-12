@@ -13,12 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app import load_and_prepare_data, get_or_train_models
 from src.forecasting import forecast_xgb, forecast_prophet, naive_baseline_forecast
+from src.time_series import expand_stay_nights, aggregate_stay_nights
 
 st.set_page_config(page_title="Revenue Forecast", page_icon="📈", layout="wide")
 st.title("📈 Revenue and Demand Forecast")
 
 try:
-    _, daily_df = load_and_prepare_data()
+    df, daily_df = load_and_prepare_data()
     models = get_or_train_models()
     eval_metrics = models["eval_metrics"]
 except Exception as e:
@@ -184,3 +185,41 @@ with st.expander("Cross-Validation Detail (Booked Revenue, XGBoost, expanding wi
         st.caption(f"Average CV MAE: {avg_mae:,.2f}")
     else:
         st.info("Cross-validation scores not available.")
+
+# ---------------------------------------------------------------------------
+# Revenue by stay night (historical)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Revenue by Stay Night (Historical)")
+st.caption(
+    "Revenue is spread across all occupied nights — not just the arrival date. "
+    "ADR × nights occupied gives a truer picture of when revenue was earned."
+)
+
+try:
+    stay_df_rev = expand_stay_nights(df)
+    occ_rev_df = aggregate_stay_nights(stay_df_rev)
+    rev_hist = occ_rev_df.iloc[-90:] if len(occ_rev_df) >= 90 else occ_rev_df
+
+    fig_rev_stay = go.Figure()
+    fig_rev_stay.add_trace(go.Bar(
+        x=rev_hist.index,
+        y=rev_hist["daily_stay_revenue"].values,
+        name="Revenue (stay nights)",
+        marker_color="darkorange",
+        opacity=0.8,
+    ))
+    fig_rev_stay.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Revenue (€)",
+        height=380,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_rev_stay, use_container_width=True)
+    st.caption(
+        f"Total stay-night revenue (last 90 days): "
+        f"€{rev_hist['daily_stay_revenue'].sum():,.0f}  |  "
+        f"Avg/night: €{rev_hist['daily_stay_revenue'].mean():,.0f}"
+    )
+except Exception as exc:
+    st.warning(f"Could not compute stay-night revenue: {exc}")
