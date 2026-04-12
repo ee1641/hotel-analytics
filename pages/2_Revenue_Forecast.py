@@ -18,6 +18,13 @@ from src.time_series import expand_stay_nights, aggregate_stay_nights
 st.set_page_config(page_title="Revenue Forecast", page_icon="📈", layout="wide")
 st.title("📈 Revenue and Demand Forecast")
 
+if st.session_state.get("defaulted_columns"):
+    st.info(
+        "Note: some columns were not in your uploaded dataset and use default assumptions: "
+        + ", ".join(f"**{c.split(' —')[0]}**" for c in st.session_state["defaulted_columns"])
+        + ". Results may not reflect real values."
+    )
+
 try:
     df, daily_df = load_and_prepare_data()
     models = get_or_train_models()

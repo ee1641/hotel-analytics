@@ -21,6 +21,13 @@ st.caption(
     "A multi-night booking contributes its full value on the arrival date only."
 )
 
+if st.session_state.get("defaulted_columns"):
+    st.info(
+        "Note: some columns were not in your uploaded dataset and use default assumptions: "
+        + ", ".join(f"**{c.split(' —')[0]}**" for c in st.session_state["defaulted_columns"])
+        + ". Results may not reflect real values."
+    )
+
 try:
     df, daily_df = load_and_prepare_data()
     models = get_or_train_models()

@@ -96,6 +96,30 @@ if uploaded is not None:
                         "Pages with missing columns will still load but may show zeros or defaults. "
                         "The warnings above tell you which pages need more data columns."
                     )
+
+                # ----------------------------------------------------------
+                # Default-value warnings for columns that affect KPIs
+                # ----------------------------------------------------------
+                _IMPACTFUL_DEFAULTS = {
+                    "adr": "ADR (average daily rate) — revenue figures will use 0",
+                    "stays_in_week_nights": "stays_in_week_nights — total nights defaulted to 1",
+                    "stays_in_weekend_nights": "stays_in_weekend_nights — total nights defaulted to 0",
+                    "adults": "adults — guest count defaulted to 2",
+                }
+                defaulted = [
+                    label
+                    for col, label in _IMPACTFUL_DEFAULTS.items()
+                    if col not in available_cols
+                ]
+                if defaulted:
+                    st.warning(
+                        "**Default values applied for missing columns:**\n\n"
+                        + "\n".join(f"- {lbl}" for lbl in defaulted)
+                        + "\n\nRevenue, occupancy, and staffing figures may not reflect real values."
+                    )
+                    st.session_state["defaulted_columns"] = defaulted
+                else:
+                    st.session_state.pop("defaulted_columns", None)
             else:
                 st.error("Schema validation failed. Please fix the issues below:")
                 for issue in issues:
