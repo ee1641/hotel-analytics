@@ -33,7 +33,7 @@ def predict_cancellation(
     check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
         import pandas as pd
-        from app import get_or_train_models
+        from src.services import get_or_train_models
         from src.preprocessing import drop_leaky_features, encode_categoricals
         context = resolve_hotel_dataset_context(hotel_id)
         models = get_or_train_models(dataset_context=context)

@@ -15,7 +15,7 @@ def get_forecast(
     """Return revenue or demand forecast for the next `horizon` days."""
     check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.forecasting import forecast_xgb
         context = resolve_hotel_dataset_context(hotel_id)
         _, daily_df = load_and_prepare_data(dataset_context=context)

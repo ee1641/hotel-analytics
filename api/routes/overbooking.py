@@ -18,7 +18,7 @@ def get_overbooking(
     """Return overbooking recommendation for a specific date."""
     check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.overbooking import calculate_overbooking_recommendation
         context = resolve_hotel_dataset_context(hotel_id)
         df, _ = load_and_prepare_data(dataset_context=context)

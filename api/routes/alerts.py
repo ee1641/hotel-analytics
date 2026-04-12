@@ -10,7 +10,7 @@ def get_alerts(hotel_id: str, authenticated_hotel_id: str = Depends(verify_api_k
     """Return today's alerts for the hotel."""
     check_hotel_ownership(hotel_id, authenticated_hotel_id)
     try:
-        from app import load_and_prepare_data, get_or_train_models
+        from src.services import load_and_prepare_data, get_or_train_models
         from src.alerts import generate_daily_alerts
         from src.forecasting import forecast_xgb
         context = resolve_hotel_dataset_context(hotel_id)
