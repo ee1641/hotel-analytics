@@ -4,7 +4,9 @@ import pytest
 from src.forecasting import (
     make_lag_features,
     train_xgb_forecaster,
+    train_xgb_forecaster_with_intervals,
     forecast_xgb,
+    forecast_xgb_with_intervals,
     train_sarima_forecaster,
     forecast_sarima,
 )
@@ -26,6 +28,7 @@ def test_lag_features_columns(daily_series):
     assert "lag_14" in df.columns
     assert "dayofweek" in df.columns
     assert "month" in df.columns
+    assert "is_holiday" in df.columns
 
 
 def test_lag_features_no_nan(daily_series):
@@ -49,6 +52,18 @@ def test_xgb_forecast_index_is_future(daily_series):
     model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7])
     preds = forecast_xgb(model, feat_cols, daily_series, periods=10)
     assert preds.index[0] > daily_series.index[-1]
+
+
+def test_xgb_quantile_forecast_columns(daily_series):
+    models = train_xgb_forecaster_with_intervals(daily_series, lags=[1, 7, 14])
+    preds = forecast_xgb_with_intervals(models, daily_series, periods=10)
+    assert set(preds.columns) == {"ds", "yhat", "yhat_lower", "yhat_upper"}
+
+
+def test_xgb_quantile_forecast_length(daily_series):
+    models = train_xgb_forecaster_with_intervals(daily_series, lags=[1, 7, 14])
+    preds = forecast_xgb_with_intervals(models, daily_series, periods=12)
+    assert len(preds) == 12
 
 
 def test_sarima_returns_result(daily_series):

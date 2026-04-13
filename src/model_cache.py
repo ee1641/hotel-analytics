@@ -14,12 +14,17 @@ MODELS_DIR = Path("models")
 
 _PATHS: dict[str, str] = {
     "xgb_revenue":      "xgb_revenue_forecaster.pkl",
+    "xgb_revenue_intervals": "xgb_revenue_interval_forecasters.pkl",
     "xgb_realized_revenue": "xgb_realized_revenue_forecaster.pkl",
+    "xgb_realized_revenue_intervals": "xgb_realized_revenue_interval_forecasters.pkl",
     "xgb_expected_revenue": "xgb_expected_revenue_forecaster.pkl",
+    "xgb_expected_revenue_intervals": "xgb_expected_revenue_interval_forecasters.pkl",
     "sarima_revenue":   "sarima_revenue_result.pkl",
     "xgb_demand":       "xgb_demand_forecaster.pkl",
+    "xgb_demand_intervals": "xgb_demand_interval_forecasters.pkl",
     "sarima_demand":    "sarima_demand_result.pkl",
     "cancel_models":    "cancellation_models.pkl",
+    "cancel_survival_model": "cancellation_survival_model.pkl",
     "feature_columns":  "feature_columns.pkl",
     "label_encoders":   "label_encoders.pkl",
     "feature_defaults": "feature_defaults.pkl",
@@ -88,6 +93,19 @@ def load_artifact_with_metadata(name: str, models_dir: Path = MODELS_DIR) -> tup
 def artifact_exists(name: str, models_dir: Path = MODELS_DIR) -> bool:
     """Return True if the persisted file exists on disk."""
     return _path_for(name, models_dir).exists()
+
+
+def artifact_matches_version(
+    name: str,
+    version: str,
+    models_dir: Path = MODELS_DIR,
+    metadata_key: str = "version",
+) -> bool:
+    """Return True when an artifact exists and its saved metadata matches version."""
+    if not artifact_exists(name, models_dir=models_dir):
+        return False
+    _, metadata = load_artifact_with_metadata(name, models_dir=models_dir)
+    return metadata.get(metadata_key) == version
 
 
 def all_artifacts_exist(models_dir: Path = MODELS_DIR) -> bool:

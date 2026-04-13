@@ -3,7 +3,7 @@ Staffing recommendations and profit/tax estimation.
 """
 import math
 import pandas as pd
-from src.services import APP_CONFIG
+from src.config import APP_CONFIG
 
 
 def estimate_staffing(
