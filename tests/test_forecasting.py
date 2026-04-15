@@ -66,6 +66,12 @@ def test_xgb_quantile_forecast_length(daily_series):
     assert len(preds) == 12
 
 
+def test_lag_features_has_rolling_std_28(daily_series):
+    df = make_lag_features(daily_series, lags=[1, 7])
+    assert "rolling_std_28" in df.columns
+    assert df["rolling_std_28"].isna().sum() == 0
+
+
 def test_sarima_returns_result(daily_series):
     result = train_sarima_forecaster(daily_series, order=(1, 1, 1))
     assert result is not None

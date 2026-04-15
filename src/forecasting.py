@@ -124,6 +124,7 @@ def make_lag_features(
     df["rolling_mean_14"] = series.shift(1).rolling(14, min_periods=1).mean()
     df["rolling_mean_28"] = series.shift(1).rolling(28, min_periods=1).mean()
     df["rolling_std_7"] = series.shift(1).rolling(7, min_periods=2).std().fillna(0.0)
+    df["rolling_std_28"] = series.shift(1).rolling(28, min_periods=2).std().fillna(0.0)
     df["trend_7"] = series.shift(1).diff(7).fillna(0.0)
 
     if "lag_364" in df.columns and "lag_365" in df.columns:
@@ -213,6 +214,7 @@ def _build_forecast_row(
         "rolling_mean_14": float(np.mean(tail14)),
         "rolling_mean_28": float(np.mean(tail28)),
         "rolling_std_7": float(np.std(tail7)) if len(tail7) > 1 else 0.0,
+        "rolling_std_28": float(np.std(tail28)) if len(tail28) > 1 else 0.0,
         "trend_7": float(tail7[-1] - tail7[0]) if len(tail7) > 1 else 0.0,
     }
 
