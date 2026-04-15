@@ -85,18 +85,20 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["is_no_show"] = (df["reservation_status"] == "No-Show").astype(int)
 
     # Booking urgency bucket: 0=short(<7 days), 1=medium(7–30), 2=long(>30)
-    df["lead_time_bucket"] = pd.cut(
-        df["lead_time"],
-        bins=[-1, 6, 30, float("inf")],
-        labels=[0, 1, 2],
-    ).astype(int)
+    if "lead_time" in df.columns:
+        df["lead_time_bucket"] = pd.cut(
+            df["lead_time"],
+            bins=[-1, 6, 30, float("inf")],
+            labels=[0, 1, 2],
+        ).astype(int)
 
     # ADR relative to this hotel's typical rate (price-positioning signal)
-    adr_mean = df["adr"].replace(0, np.nan).mean()
-    if pd.notna(adr_mean) and adr_mean > 0:
-        df["adr_vs_hotel_mean"] = (df["adr"] / adr_mean).clip(0, 10)
-    else:
-        df["adr_vs_hotel_mean"] = 1.0
+    if "adr" in df.columns:
+        adr_mean = df["adr"].replace(0, np.nan).mean()
+        if pd.notna(adr_mean) and adr_mean > 0:
+            df["adr_vs_hotel_mean"] = (df["adr"] / adr_mean).clip(0, 10)
+        else:
+            df["adr_vs_hotel_mean"] = 1.0
 
     return df
 

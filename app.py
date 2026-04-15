@@ -2,6 +2,7 @@
 Hotel Analytics Dashboard - Streamlit entry point.
 Run with: streamlit run app.py
 """
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -423,7 +424,8 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                 second_df,
             )
             eval_metrics["cross_dataset"] = cross_results
-        except Exception:
+        except Exception as exc:
+            logging.warning("Cross-dataset evaluation failed: %s", exc)
             eval_metrics["cross_dataset"] = {}
 
         results["eval_metrics"] = eval_metrics

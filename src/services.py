@@ -290,7 +290,8 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
                 results["feature_defaults"],
                 second_df,
             )
-        except Exception:
+        except Exception as exc:
+            log.warning("Cross-dataset evaluation failed: %s", exc)
             eval_metrics["cross_dataset"] = {}
 
         results["eval_metrics"] = eval_metrics
