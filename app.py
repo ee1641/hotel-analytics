@@ -11,7 +11,6 @@ warnings.filterwarnings("ignore")
 
 import pandas as pd
 import streamlit as st
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from src import model_cache
@@ -168,7 +167,10 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["feature_defaults"] = model_cache.load_artifact("feature_defaults", models_dir=models_path)
         results["selected_features"] = model_cache.load_artifact("selected_features", models_dir=models_path) or []
     else:
-        df_cancel = drop_leaky_features(df)
+        # Sort by arrival_date for time-based split — prevents future booking
+        # info leaking into the cancellation model's training data.
+        df_sorted = df.sort_values("arrival_date")
+        df_cancel = drop_leaky_features(df_sorted)
 
         label_encoders = {}
         for col in _CATEGORICAL_COLS:
@@ -178,7 +180,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                 df_cancel[col] = le.fit_transform(df_cancel[col].astype(str))
                 label_encoders[col] = le
 
-        X, y_cancel, _ = encode_categoricals(drop_leaky_features(df))
+        X, y_cancel, _ = encode_categoricals(drop_leaky_features(df_sorted))
         feature_columns = list(X.columns)
 
         feature_defaults = {}
@@ -189,13 +191,12 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             else:
                 feature_defaults[col] = float(col_data.mode().iloc[0])
 
-        X_tr, _, y_tr, _ = train_test_split(
-            X,
-            y_cancel,
-            test_size=0.2,
-            random_state=42,
-            stratify=y_cancel,
-        )
+        # Time-based 80/20 split (last 20% of sorted dates as test)
+        n_test = max(1, int(len(X) * 0.2))
+        X_tr = X.iloc[:-n_test]
+        y_tr = y_cancel.iloc[:-n_test]
+        X_te = X.iloc[-n_test:]
+
         spw = compute_scale_pos_weight(y_tr.values)
         best_xgb_params = tune_xgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
         cancel_models = train_cancellation_models_balanced(
@@ -209,14 +210,6 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
-        _, X_te, _, _ = train_test_split(
-            X,
-            y_cancel,
-            test_size=0.2,
-            random_state=42,
-            stratify=y_cancel,
-        )
         shap_df = get_shap_feature_importance(
             cancel_models["xgboost"],
             X_te.values,

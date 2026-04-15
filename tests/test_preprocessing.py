@@ -185,3 +185,14 @@ def test_lead_time_bucket_boundary():
     })
     out = engineer_features(df)
     assert list(out["lead_time_bucket"]) == [0, 1, 1, 2]
+
+
+def test_time_split_no_future_data_in_train():
+    """Time-based split: max(train arrival_date) must be < min(test arrival_date)."""
+    dates = pd.date_range("2020-01-01", "2021-12-31", freq="D")
+    df = pd.DataFrame({"arrival_date": dates})
+    df_sorted = df.sort_values("arrival_date")
+    n_test = max(1, int(len(df_sorted) * 0.2))
+    train = df_sorted.iloc[:-n_test]
+    test = df_sorted.iloc[-n_test:]
+    assert train["arrival_date"].max() < test["arrival_date"].min()
