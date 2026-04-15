@@ -74,6 +74,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     Derive new columns.
     NOTE: reservation_status is kept here — it is needed by time_series.py
     for is_no_show creation and is dropped later inside encode_categoricals.
+    booking_dow is computed in add_temporal_features() where arrival_date is a datetime.
     """
     df = df.copy()
     df["total_nights"] = df["stays_in_weekend_nights"] + df["stays_in_week_nights"]
@@ -82,6 +83,21 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     if "reservation_status" not in df.columns:
         df["reservation_status"] = "Check-Out"
     df["is_no_show"] = (df["reservation_status"] == "No-Show").astype(int)
+
+    # Booking urgency bucket: 0=short(<7 days), 1=medium(7–30), 2=long(>30)
+    df["lead_time_bucket"] = pd.cut(
+        df["lead_time"],
+        bins=[-1, 6, 30, float("inf")],
+        labels=[0, 1, 2],
+    ).astype(int)
+
+    # ADR relative to this hotel's typical rate (price-positioning signal)
+    adr_mean = df["adr"].replace(0, np.nan).mean()
+    if pd.notna(adr_mean) and adr_mean > 0:
+        df["adr_vs_hotel_mean"] = (df["adr"] / adr_mean).clip(0, 10)
+    else:
+        df["adr_vs_hotel_mean"] = 1.0
+
     return df
 
 
@@ -166,11 +182,19 @@ def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
       booking_month      : int 1-12
       season             : int 0=spring, 1=summer, 2=fall, 3=winter
       is_weekend_arrival : int 0/1 (Saturday=5 or Sunday=6)
+      booking_dow        : int 0-6 (day of week when the booking was placed)
     """
     df = df.copy()
     df["booking_month"] = df["arrival_date"].dt.month.astype(int)
     df["season"] = df["booking_month"].map(_SEASON_MAP).astype(int)
     df["is_weekend_arrival"] = (df["arrival_date"].dt.dayofweek >= 5).astype(int)
+
+    # Day of week the booking was placed (arrival_date minus lead_time days)
+    booking_date = pd.to_datetime(df["arrival_date"]) - pd.to_timedelta(
+        df["lead_time"].clip(lower=0), unit="D"
+    )
+    df["booking_dow"] = booking_date.dt.dayofweek
+
     return df
 
 

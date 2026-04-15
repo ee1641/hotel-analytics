@@ -122,3 +122,66 @@ def test_drop_leaky_then_encode_has_no_leaky_cols(engineered_df):
     X, _, _ = encode_categoricals(drop_leaky_features(engineered_df))
     for col in LEAKY_COLUMNS:
         assert col not in X.columns, f"Leaky column '{col}' leaked into feature matrix"
+
+
+def test_engineer_features_lead_time_bucket():
+    """lead_time_bucket: 0=short(<7 days), 1=medium(7-30), 2=long(>30)."""
+    df = pd.DataFrame({
+        "stays_in_weekend_nights": [1, 1, 1],
+        "stays_in_week_nights":    [2, 2, 2],
+        "adults": [2, 2, 2],
+        "children": [0, 0, 0],
+        "babies": [0, 0, 0],
+        "adr": [100.0, 100.0, 100.0],
+        "lead_time": [3, 15, 60],
+        "is_canceled": [0, 0, 0],
+    })
+    out = engineer_features(df)
+    assert "lead_time_bucket" in out.columns
+    assert list(out["lead_time_bucket"]) == [0, 1, 2]
+
+
+def test_engineer_features_adr_vs_hotel_mean():
+    """adr_vs_hotel_mean: ratio clipped to [0, 10], finite for all rows."""
+    df = pd.DataFrame({
+        "stays_in_weekend_nights": [1, 1],
+        "stays_in_week_nights":    [2, 2],
+        "adults": [2, 2],
+        "children": [0, 0],
+        "babies": [0, 0],
+        "adr": [50.0, 150.0],
+        "lead_time": [10, 10],
+        "is_canceled": [0, 0],
+    })
+    out = engineer_features(df)
+    assert "adr_vs_hotel_mean" in out.columns
+    assert (out["adr_vs_hotel_mean"] >= 0).all()
+    assert (out["adr_vs_hotel_mean"] <= 10).all()
+
+
+def test_add_temporal_features_booking_dow():
+    """booking_dow: integer in 0-6 derived from arrival_date minus lead_time days."""
+    df = pd.DataFrame({
+        "arrival_date": pd.to_datetime(["2024-06-10", "2024-06-15"]),
+        "lead_time": [10, 5],
+    })
+    from src.preprocessing import add_temporal_features
+    out = add_temporal_features(df)
+    assert "booking_dow" in out.columns
+    assert out["booking_dow"].between(0, 6).all()
+
+
+def test_lead_time_bucket_boundary():
+    """Boundary values: 6 → bucket 0, 7 → bucket 1, 30 → bucket 1, 31 → bucket 2."""
+    df = pd.DataFrame({
+        "stays_in_weekend_nights": [0, 0, 0, 0],
+        "stays_in_week_nights":    [1, 1, 1, 1],
+        "adults": [2, 2, 2, 2],
+        "children": [0, 0, 0, 0],
+        "babies": [0, 0, 0, 0],
+        "adr": [100.0] * 4,
+        "lead_time": [6, 7, 30, 31],
+        "is_canceled": [0, 0, 0, 0],
+    })
+    out = engineer_features(df)
+    assert list(out["lead_time_bucket"]) == [0, 1, 1, 2]
