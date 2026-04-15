@@ -20,6 +20,7 @@ from src.cancellation import (
     select_top_features,
     train_cancellation_models_balanced,
     train_cancellation_survival_model,
+    tune_xgb_cancellation,
 )
 from src.cancellation_evaluation import evaluate_cross_dataset
 from src.config import APP_CONFIG
@@ -183,10 +184,12 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             stratify=y_cancel,
         )
         spw = compute_scale_pos_weight(y_tr.values)
+        best_xgb_params = tune_xgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
         cancel_models = train_cancellation_models_balanced(
             X_tr.values,
             y_tr.values,
             scale_pos_weight=spw,
+            xgb_params=best_xgb_params,
         )
 
         import matplotlib

@@ -6,7 +6,9 @@ from src.cancellation import (
     predict_booking_survival_profile,
     predict_cancellation_proba,
     train_cancellation_models,
+    train_cancellation_models_balanced,
     train_cancellation_survival_model,
+    tune_xgb_cancellation,
 )
 
 
@@ -65,3 +67,11 @@ def test_survival_profile_is_monotonic():
     probs = profile["survival_probability"].tolist()
     assert all(0 <= p <= 1 for p in probs)
     assert probs == sorted(probs, reverse=True)
+
+
+def test_tune_xgb_returns_valid_params(synth):
+    X_tr, _, y_tr, _ = synth
+    params = tune_xgb_cancellation(X_tr, y_tr, scale_pos_weight=1.0, n_iter=2, cv=2)
+    assert isinstance(params, dict)
+    for key in ("n_estimators", "max_depth", "learning_rate"):
+        assert key in params

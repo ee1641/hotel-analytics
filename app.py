@@ -21,6 +21,7 @@ from src.cancellation import (
     select_top_features,
     train_cancellation_models_balanced,
     train_cancellation_survival_model,
+    tune_xgb_cancellation,
 )
 from src.cancellation_evaluation import _align_to_feature_columns, evaluate_cross_dataset
 from src.data_context import (
@@ -196,10 +197,12 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             stratify=y_cancel,
         )
         spw = compute_scale_pos_weight(y_tr.values)
+        best_xgb_params = tune_xgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
         cancel_models = train_cancellation_models_balanced(
             X_tr.values,
             y_tr.values,
             scale_pos_weight=spw,
+            xgb_params=best_xgb_params,
         )
 
         import matplotlib

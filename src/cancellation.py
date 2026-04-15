@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
@@ -58,13 +59,53 @@ def compute_scale_pos_weight(y: np.ndarray) -> float:
     return float(counts[0] / counts[1])
 
 
+def tune_xgb_cancellation(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    scale_pos_weight: float,
+    n_iter: int = 10,
+    cv: int = 3,
+) -> dict:
+    """
+    Run RandomizedSearchCV over XGBoost hyperparameters.
+    Returns best_params_ dict; pass as xgb_params to train_cancellation_models_balanced.
+    Uses n_jobs=-1 for parallel fold evaluation.
+    """
+    param_dist = {
+        "n_estimators": [100, 200, 400, 600],
+        "max_depth": [4, 6, 8],
+        "learning_rate": [0.01, 0.05, 0.1],
+        "subsample": [0.8, 0.9, 1.0],
+        "colsample_bytree": [0.8, 0.9, 1.0],
+    }
+    base = XGBClassifier(
+        eval_metric="logloss",
+        verbosity=0,
+        random_state=42,
+        scale_pos_weight=scale_pos_weight,
+    )
+    search = RandomizedSearchCV(
+        base,
+        param_dist,
+        n_iter=n_iter,
+        cv=cv,
+        scoring="roc_auc",
+        random_state=42,
+        n_jobs=-1,
+    )
+    search.fit(X_tr, y_tr)
+    return search.best_params_
+
+
 def train_cancellation_models_balanced(
     X_train,
     y_train,
     scale_pos_weight: float = None,
+    xgb_params: dict | None = None,
 ) -> dict:
     """
     Like train_cancellation_models but with class-imbalance corrections.
+    Pass xgb_params (from tune_xgb_cancellation) to override default XGB hyperparameters.
     """
     spw = scale_pos_weight if scale_pos_weight is not None else compute_scale_pos_weight(y_train)
     models = {
@@ -82,13 +123,17 @@ def train_cancellation_models_balanced(
             class_weight="balanced",
         ),
         "xgboost": XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.1,
-            eval_metric="logloss",
-            verbosity=0,
-            random_state=42,
-            scale_pos_weight=spw,
+            **{
+                "n_estimators": 200,
+                "max_depth": 6,
+                "learning_rate": 0.1,
+                **(xgb_params or {}),
+                # Always enforced regardless of xgb_params:
+                "eval_metric": "logloss",
+                "verbosity": 0,
+                "random_state": 42,
+                "scale_pos_weight": spw,
+            }
         ),
     }
     for model in models.values():
