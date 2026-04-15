@@ -1,6 +1,8 @@
 """
 Date construction and daily time-series aggregation for hotel bookings.
 """
+import logging
+
 import pandas as pd
 
 from src.preprocessing import ensure_revenue_columns
@@ -71,6 +73,39 @@ def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
     grouped = grouped.reindex(full_range, fill_value=0)
     grouped.index.name = "arrival_date"
     return grouped
+
+
+def aggregate_daily_by_hotel_type(
+    df: pd.DataFrame,
+    min_history: int = 31,
+) -> dict[str, pd.DataFrame]:
+    """
+    Segment bookings by the `hotel` column and aggregate each type to a daily
+    time series using the same logic as aggregate_daily().
+
+    Returns a dict mapping hotel type name → daily DataFrame (same schema as
+    aggregate_daily()). Hotel types with fewer than `min_history` daily
+    observations are skipped with a warning.
+    """
+    result: dict[str, pd.DataFrame] = {}
+    if "hotel" not in df.columns:
+        logging.warning(
+            "aggregate_daily_by_hotel_type: no 'hotel' column found; returning empty dict."
+        )
+        return result
+    for hotel_type in df["hotel"].dropna().unique():
+        subset = df[df["hotel"] == hotel_type]
+        daily = aggregate_daily(subset)
+        if len(daily) < min_history:
+            logging.warning(
+                "Hotel type '%s' has only %d days of history (min %d); skipping.",
+                hotel_type,
+                len(daily),
+                min_history,
+            )
+            continue
+        result[str(hotel_type)] = daily
+    return result
 
 
 def expand_stay_nights(df: pd.DataFrame) -> pd.DataFrame:

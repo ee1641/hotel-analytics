@@ -166,6 +166,124 @@ def build_pickup_report(
     return report
 
 
+def build_otb_feature_matrix(
+    df: pd.DataFrame,
+    lead_times: list[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Build historical OTB (on-the-books) features for each arrival date.
+
+    SCHEMA ASSUMPTION (Step 0 validated): This function uses
+    ``reservation_status_date`` as the cancellation timestamp for cancelled
+    bookings (``is_canceled == 1``).  This is the Kaggle hotel_bookings.csv
+    clean path — ``reservation_status_date`` records the exact date a
+    cancellation occurred, so snapshot-as-of logic is leak-free:
+    a booking counts as OTB at snapshot S iff it was placed before S AND
+    had not yet cancelled as of S (``cancel_date`` is NaT OR
+    ``cancel_date > S``).  If ``reservation_status_date`` is absent,
+    ``cancel_date`` will be NaT for all rows, making the OTB count
+    conservative (no cancellation filtering) but not leaky.
+
+    For each arrival date ``d`` and lead time ``k``, counts bookings where:
+
+    * ``booking_date <= (d - k days)``   — booked at least k days in advance
+    * ``cancel_date is NaT OR cancel_date > (d - k days)`` — not yet cancelled
+
+    This is a **training-time** feature: the snapshot is arrival-relative
+    (``d - k``), so each row captures how many rooms were on the books with
+    *k* days to go before arrival.  At inference time, pass
+    ``pickup_report_to_otb_features(pickup_report)`` as ``future_features``
+    to ``forecast_xgb``.
+
+    Args:
+        df: booking-level DataFrame (needs arrival_date, lead_time,
+            is_canceled, reservation_status_date).
+        lead_times: days-before-arrival snapshots. Default ``[7, 14, 30, 60]``.
+
+    Returns:
+        DataFrame indexed by ``arrival_date`` with columns
+        ``otb_7d``, ``otb_14d``, ``otb_30d``, ``otb_60d`` (or matching
+        ``lead_times``).  No date gaps — aligns with ``aggregate_daily()``
+        output.
+    """
+    _lead_times: list[int] = list(lead_times or [7, 14, 30, 60])
+    timeline = prepare_booking_timeline(df)
+    if timeline.empty:
+        return pd.DataFrame(columns=[f"otb_{k}d" for k in _lead_times])
+
+    timeline = timeline.copy()
+    timeline["arrival_date"] = timeline["arrival_date"].dt.normalize()
+
+    arrival_dates = timeline["arrival_date"].sort_values().unique()
+    records = []
+    for arrival in arrival_dates:
+        group = timeline[timeline["arrival_date"] == arrival]
+        row: dict = {"arrival_date": arrival}
+        for k in _lead_times:
+            snapshot = arrival - pd.Timedelta(days=k)
+            mask = (group["booking_date"] <= snapshot) & (
+                group["cancel_date"].isna() | (group["cancel_date"] > snapshot)
+            )
+            row[f"otb_{k}d"] = int(mask.sum())
+        records.append(row)
+
+    result = pd.DataFrame(records).set_index("arrival_date")
+    result.index = pd.DatetimeIndex(result.index).normalize()
+    result.index.name = "arrival_date"
+
+    # Fill date gaps so index aligns with aggregate_daily() output
+    full_range = pd.date_range(result.index.min(), result.index.max(), freq="D")
+    result = result.reindex(full_range, fill_value=0)
+    result.index.name = "arrival_date"
+    return result
+
+
+def pickup_report_to_otb_features(
+    pickup_report: pd.DataFrame,
+    lead_times: list[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Convert a pickup report (from ``build_pickup_report``) to a
+    ``future_features`` DataFrame for use with
+    ``forecast_xgb(future_features=...)``.
+
+    At inference time the OTB features approximate the training-time
+    arrival-relative snapshot using the best available pickup-report columns:
+
+    * ``otb_7d``  ← ``otb_today``   (current OTB; best proxy for k=7)
+    * ``otb_14d`` ← ``otb_today``
+    * ``otb_30d`` ← ``otb_30d_ago`` (if column present, else ``otb_today``)
+    * ``otb_60d`` ← ``otb_30d_ago`` (if column present, else ``otb_today``)
+
+    Args:
+        pickup_report: DataFrame returned by ``build_pickup_report``.
+        lead_times: must match the ``lead_times`` used at training time.
+            Default ``[7, 14, 30, 60]``.
+
+    Returns:
+        DataFrame indexed by arrival date with one column per lead time.
+    """
+    _lead_times: list[int] = list(lead_times or [7, 14, 30, 60])
+    idx = pd.DatetimeIndex(pd.to_datetime(pickup_report["date"]))
+    result = pd.DataFrame(index=idx)
+
+    otb_today = pickup_report["otb_today"].values
+    otb_30d_ago = (
+        pickup_report["otb_30d_ago"].values
+        if "otb_30d_ago" in pickup_report.columns
+        else otb_today
+    )
+    _mapping: dict[int, object] = {
+        7: otb_today,
+        14: otb_today,
+        30: otb_30d_ago,
+        60: otb_30d_ago,
+    }
+    for k in _lead_times:
+        result[f"otb_{k}d"] = _mapping.get(k, otb_today)
+    return result.fillna(0)
+
+
 def build_segment_mix_report(
     df: pd.DataFrame,
     snapshot_date: pd.Timestamp | None = None,

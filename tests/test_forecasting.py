@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 import pytest
 from src.forecasting import (
+    blend_forecasts,
+    find_ensemble_weights,
+    make_calendar_features,
     make_lag_features,
     train_xgb_forecaster,
     train_xgb_forecaster_with_intervals,
@@ -11,6 +14,7 @@ from src.forecasting import (
     forecast_xgb_with_intervals,
     train_sarima_forecaster,
     forecast_sarima,
+    _school_holiday_features,
 )
 
 
@@ -95,5 +99,119 @@ def test_direct_multistep_forecast_no_accumulation(daily_series):
     models = train_xgb_direct_multistep(daily_series, horizons=5, lags=[1, 7])
     preds = forecast_xgb_direct(models, daily_series)
     assert len(preds) == 5
+
+
+# ---------------------------------------------------------------------------
+# OTB extra_features / future_features tests
+# ---------------------------------------------------------------------------
+
+def test_xgb_forecast_with_extra_features(daily_series):
+    """Model trains and forecasts without error when extra_features are provided."""
+    otb = pd.DataFrame(
+        {"otb_7d": 10, "otb_14d": 8, "otb_30d": 5, "otb_60d": 2},
+        index=daily_series.index,
+    )
+    model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7], extra_features=otb)
+    assert any(c.startswith("otb_") for c in feat_cols)
+    preds = forecast_xgb(model, feat_cols, daily_series, periods=10)
+    assert len(preds) == 10
+
+
+def test_xgb_forecast_sparse_future_features(daily_series):
+    """forecast_xgb does not crash when future_features covers fewer dates than periods."""
+    model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7])
+    # Only cover 5 of the 10 future dates
+    future_dates = pd.date_range(
+        daily_series.index[-1] + pd.Timedelta(days=1), periods=5, freq="D"
+    )
+    future_features = pd.DataFrame({"dummy": 0}, index=future_dates)
+    preds = forecast_xgb(model, feat_cols, daily_series, periods=10,
+                         future_features=future_features)
+    assert len(preds) == 10
     assert preds.index[0] > daily_series.index[-1]
     assert preds.isna().sum() == 0
+
+
+# ---------------------------------------------------------------------------
+# School holiday features
+# ---------------------------------------------------------------------------
+
+def test_school_holiday_columns():
+    """_school_holiday_features returns the expected columns."""
+    idx = pd.date_range("2023-01-01", periods=365, freq="D")
+    df = _school_holiday_features(idx)
+    assert "is_summer_holiday" in df.columns
+    assert "is_easter_holiday" in df.columns
+    assert "is_christmas_holiday" in df.columns
+    assert "is_school_holiday" in df.columns
+
+
+def test_summer_holiday_flag():
+    """August 15 is in summer holiday."""
+    idx = pd.DatetimeIndex([pd.Timestamp("2023-08-15")])
+    df = _school_holiday_features(idx)
+    assert int(df["is_summer_holiday"].iloc[0]) == 1
+
+
+def test_non_holiday_flag():
+    """October 20 is not a school holiday."""
+    idx = pd.DatetimeIndex([pd.Timestamp("2023-10-20")])
+    df = _school_holiday_features(idx)
+    assert int(df["is_school_holiday"].iloc[0]) == 0
+
+
+def test_calendar_features_includes_school_holidays():
+    """make_calendar_features includes school holiday columns."""
+    idx = pd.date_range("2023-01-01", periods=10, freq="D")
+    df = make_calendar_features(idx)
+    assert "is_school_holiday" in df.columns
+    assert "is_summer_holiday" in df.columns
+
+
+def test_lag_features_includes_school_holidays():
+    """make_lag_features propagates school holiday columns into the feature matrix."""
+    dates = pd.date_range("2023-01-01", periods=100, freq="D")
+    series = pd.Series(np.ones(100), index=dates)
+    df = make_lag_features(series, lags=[1, 7])
+    assert "is_school_holiday" in df.columns
+
+
+# ---------------------------------------------------------------------------
+# Ensemble blending
+# ---------------------------------------------------------------------------
+
+def test_find_ensemble_weights_returns_valid_weight():
+    """find_ensemble_weights returns a float in [0, 1]."""
+    xgb   = np.array([10.0, 11.0, 12.0, 9.0])
+    prophet = np.array([9.5, 10.5, 11.5, 9.5])
+    actual  = np.array([10.2, 10.8, 11.8, 9.2])
+    w = find_ensemble_weights(xgb, prophet, actual)
+    assert 0.0 <= w <= 1.0
+
+
+def test_find_ensemble_weights_prefers_better_model():
+    """When XGB perfectly predicts, weight should be 1.0."""
+    actual  = np.array([10.0, 20.0, 30.0, 40.0])
+    perfect = actual.copy()
+    noisy   = actual + 5.0
+    w = find_ensemble_weights(perfect, noisy, actual)
+    assert w == 1.0
+
+
+def test_blend_forecasts_correct_shape(daily_series):
+    """blend_forecasts returns a Series with the same index as xgb_forecast."""
+    model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7])
+    xgb_fc = forecast_xgb(model, feat_cols, daily_series, periods=10)
+    prophet_vals = pd.Series(xgb_fc.values * 1.05, index=xgb_fc.index)
+    result = blend_forecasts(xgb_fc, prophet_vals, xgb_weight=0.7)
+    assert len(result) == len(xgb_fc)
+    assert list(result.index) == list(xgb_fc.index)
+
+
+def test_blend_forecasts_weight_1_equals_xgb(daily_series):
+    """Weight=1.0 produces exactly the XGBoost forecast."""
+    model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7])
+    xgb_fc = forecast_xgb(model, feat_cols, daily_series, periods=10)
+    other = xgb_fc * 2.0
+    result = blend_forecasts(xgb_fc, other, xgb_weight=1.0)
+    np.testing.assert_array_almost_equal(result.values, xgb_fc.values)

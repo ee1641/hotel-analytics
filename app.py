@@ -14,6 +14,8 @@ import streamlit as st
 from sklearn.preprocessing import LabelEncoder
 
 from src import model_cache
+from src.revenue_management import build_otb_feature_matrix  # available for analytics; not injected into training
+from src.weather import build_weather_features
 from src.cancellation import (
     compute_scale_pos_weight,
     get_shap_feature_importance,
@@ -30,21 +32,30 @@ from src.data_context import (
 )
 from src.evaluation import regression_metrics, ts_cross_val_scores
 from src.forecasting import (
+    blend_forecasts,
+    find_ensemble_weights,
     forecast_prophet,
     forecast_xgb,
     naive_baseline_forecast,
     train_prophet_forecaster,
     train_xgb_forecaster,
     train_xgb_forecaster_with_intervals,
+    tune_xgb_forecaster,
 )
 from src.ingestion import load_cancellation_prediction_csv
 from src.model_specs import (
+    CANCELLATION_MODEL_VERSION,
+    ENSEMBLE_WEIGHTS_VERSION,
     EVAL_METRICS_VERSION,
     FORECAST_LAGS,
     FORECAST_MODEL_VERSION,
+    FORECAST_TUNE_N_ITER,
+    FORECAST_TUNE_N_SPLITS,
     INTERVAL_MODEL_VERSION,
     MIN_FORECAST_HISTORY,
     PROPHET_MODEL_VERSION,
+    SEGMENTED_INTERVAL_VERSION,
+    SEGMENTED_MODEL_VERSION,
     SURVIVAL_MODEL_VERSION,
 )
 from src.preprocessing import (
@@ -56,10 +67,15 @@ from src.preprocessing import (
     engineer_features,
     load_data,
 )
-from src.time_series import aggregate_daily, build_arrival_date
+from src.time_series import aggregate_daily, aggregate_daily_by_hotel_type, build_arrival_date
 
 DATA_PATH = "hotel_bookings.csv"
 APP_MODE = os.getenv("APP_MODE", "demo")
+
+
+def _hotel_slug(hotel_type: str) -> str:
+    """'Resort Hotel' → 'resort_hotel' (used as cache-key suffix)."""
+    return hotel_type.lower().replace(" ", "_")
 
 
 def _validated_forecast_series(
@@ -160,7 +176,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
     # ------------------------------------------------------------------
     # Cancellation classification
     # ------------------------------------------------------------------
-    if model_cache.artifact_exists("cancel_models", models_dir=models_path):
+    if _artifact_current("cancel_models", CANCELLATION_MODEL_VERSION, models_dir=models_path):
         results["cancel_models"] = model_cache.load_artifact("cancel_models", models_dir=models_path)
         results["feature_columns"] = model_cache.load_artifact("feature_columns", models_dir=models_path)
         results["label_encoders"] = model_cache.load_artifact("label_encoders", models_dir=models_path)
@@ -232,7 +248,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["label_encoders"] = label_encoders
         results["feature_defaults"] = feature_defaults
         results["selected_features"] = selected_features
-        model_cache.save_artifact("cancel_models", cancel_models, models_dir=models_path)
+        _save_versioned("cancel_models", cancel_models, CANCELLATION_MODEL_VERSION, models_path)
         model_cache.save_artifact("feature_columns", feature_columns, models_dir=models_path)
         model_cache.save_artifact("label_encoders", label_encoders, models_dir=models_path)
         model_cache.save_artifact("feature_defaults", feature_defaults, models_dir=models_path)
@@ -247,6 +263,41 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
     )
     results["df_with_expected_revenue"] = df_with_expected_revenue
     results["daily_revenue_views"] = revenue_daily_df
+
+    # ------------------------------------------------------------------
+    # OTB-30d feature matrix — otb_30d only, snapshot at arrival-30 days.
+    # At inference, otb_today for dates 30 days out is the exact same
+    # quantity (bookings made 30+ days before arrival), so training and
+    # inference distributions are aligned.
+    # ------------------------------------------------------------------
+    try:
+        otb_matrix_combined = build_otb_feature_matrix(df, lead_times=[30, 60])[["otb_30d", "otb_60d"]]
+    except Exception as exc:
+        logging.warning("OTB-30d matrix failed (training without OTB): %s", exc)
+        otb_matrix_combined = pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Weather feature matrix (Track 3) — Open-Meteo historical archive.
+    # Fetched once and cached in data/weather_portugal.csv.
+    # ------------------------------------------------------------------
+    try:
+        weather_matrix = build_weather_features(daily_df.index)
+    except Exception as exc:
+        logging.warning("Weather features unavailable (training without): %s", exc)
+        weather_matrix = pd.DataFrame()
+
+    def _combined_extra(series_index: pd.Index) -> pd.DataFrame | None:
+        """Merge OTB + weather extra features aligned to a series index."""
+        frames = []
+        if not otb_matrix_combined.empty:
+            frames.append(otb_matrix_combined.reindex(series_index).fillna(0))
+        if not weather_matrix.empty:
+            frames.append(weather_matrix.reindex(series_index).fillna(0))
+        if not frames:
+            return None
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, axis=1)
 
     revenue_model_specs = [
         (
@@ -297,18 +348,25 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
     for xgb_key, interval_key, prophet_key, column, label in revenue_model_specs:
         series = _validated_forecast_series(revenue_daily_df, column, dataset_id, label)
         revenue_series_lookup[column] = series
+        _extra = _combined_extra(series.index)
 
         if _artifact_current(xgb_key, FORECAST_MODEL_VERSION, models_dir=models_path):
             results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
         else:
-            xgb_m, xgb_cols = train_xgb_forecaster(series, lags=FORECAST_LAGS)
+            best_p = tune_xgb_forecaster(series, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            xgb_m, xgb_cols = train_xgb_forecaster(series, lags=FORECAST_LAGS,
+                                                    extra_features=_extra, **best_p)
             results[xgb_key] = (xgb_m, xgb_cols)
             _save_versioned(xgb_key, (xgb_m, xgb_cols), FORECAST_MODEL_VERSION, models_path)
 
         if _artifact_current(interval_key, INTERVAL_MODEL_VERSION, models_dir=models_path):
             results[interval_key] = model_cache.load_artifact(interval_key, models_dir=models_path)
         else:
-            interval_models = train_xgb_forecaster_with_intervals(series, lags=FORECAST_LAGS)
+            best_p = tune_xgb_forecaster(series, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            interval_models = train_xgb_forecaster_with_intervals(series, lags=FORECAST_LAGS,
+                                                                   extra_features=_extra, **best_p)
             results[interval_key] = interval_models
             _save_versioned(interval_key, interval_models, INTERVAL_MODEL_VERSION, models_path)
 
@@ -320,18 +378,25 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             _save_versioned(prophet_key, prophet_model, PROPHET_MODEL_VERSION, models_path)
 
     dem_series = _validated_forecast_series(revenue_daily_df, "daily_bookings", dataset_id, "booking")
+    _extra_dem = _combined_extra(dem_series.index)
 
     if _artifact_current("xgb_demand", FORECAST_MODEL_VERSION, models_dir=models_path):
         results["xgb_demand"] = model_cache.load_artifact("xgb_demand", models_dir=models_path)
     else:
-        xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS)
+        best_p = tune_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
+                                     n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+        xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
+                                                   extra_features=_extra_dem, **best_p)
         results["xgb_demand"] = (xgb_d, xgb_d_cols)
         _save_versioned("xgb_demand", (xgb_d, xgb_d_cols), FORECAST_MODEL_VERSION, models_path)
 
     if _artifact_current("xgb_demand_intervals", INTERVAL_MODEL_VERSION, models_dir=models_path):
         results["xgb_demand_intervals"] = model_cache.load_artifact("xgb_demand_intervals", models_dir=models_path)
     else:
-        interval_models = train_xgb_forecaster_with_intervals(dem_series, lags=FORECAST_LAGS)
+        best_p = tune_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
+                                     n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+        interval_models = train_xgb_forecaster_with_intervals(dem_series, lags=FORECAST_LAGS,
+                                                               extra_features=_extra_dem, **best_p)
         results["xgb_demand_intervals"] = interval_models
         _save_versioned("xgb_demand_intervals", interval_models, INTERVAL_MODEL_VERSION, models_path)
 
@@ -342,6 +407,52 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["prophet_demand"] = prophet_dem
         _save_versioned("prophet_demand", prophet_dem, PROPHET_MODEL_VERSION, models_path)
 
+    # ------------------------------------------------------------------
+    # Ensemble weights: find optimal XGBoost weight in XGBoost+Prophet blend
+    # Optimised on a 60-day validation window before the holdout test set.
+    # ------------------------------------------------------------------
+    if _artifact_current("ensemble_weights", ENSEMBLE_WEIGHTS_VERSION, models_dir=models_path):
+        results["ensemble_weights"] = model_cache.load_artifact("ensemble_weights", models_dir=models_path)
+    else:
+        try:
+            val_days = 60
+            test_days_ew = 30
+            dem_val = dem_series.iloc[-(test_days_ew + val_days):-test_days_ew]
+            dem_val_train = dem_series.iloc[:-(test_days_ew + val_days)]
+            _val_extra = _combined_extra(dem_val_train.index)
+            _vp_dem = tune_xgb_forecaster(dem_val_train, lags=FORECAST_LAGS,
+                                          n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            xgb_val_m, xgb_val_c = train_xgb_forecaster(dem_val_train, lags=FORECAST_LAGS,
+                                                          extra_features=_val_extra, **_vp_dem)
+            prophet_val_m = train_prophet_forecaster(dem_val_train)
+            xgb_val_preds  = forecast_xgb(xgb_val_m, xgb_val_c, dem_val_train, val_days)
+            prophet_val_df = forecast_prophet(prophet_val_m, val_days)
+            w_dem = find_ensemble_weights(xgb_val_preds.values, prophet_val_df["yhat"].values,
+                                          dem_val.values)
+
+            # Revenue ensemble weight (booked revenue)
+            rev_series = revenue_series_lookup["daily_booked_revenue"]
+            rev_val = rev_series.iloc[-(test_days_ew + val_days):-test_days_ew]
+            rev_val_train = rev_series.iloc[:-(test_days_ew + val_days)]
+            _val_extra_rev = _combined_extra(rev_val_train.index)
+            _vp_rev = tune_xgb_forecaster(rev_val_train, lags=FORECAST_LAGS,
+                                          n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            xgb_rev_val_m, xgb_rev_val_c = train_xgb_forecaster(rev_val_train, lags=FORECAST_LAGS,
+                                                                   extra_features=_val_extra_rev, **_vp_rev)
+            prophet_rev_val_m = train_prophet_forecaster(rev_val_train)
+            xgb_rev_preds     = forecast_xgb(xgb_rev_val_m, xgb_rev_val_c, rev_val_train, val_days)
+            prophet_rev_df    = forecast_prophet(prophet_rev_val_m, val_days)
+            w_rev = find_ensemble_weights(xgb_rev_preds.values, prophet_rev_df["yhat"].values,
+                                          rev_val.values)
+
+            ensemble_weights = {"demand": w_dem, "revenue": w_rev}
+            results["ensemble_weights"] = ensemble_weights
+            _save_versioned("ensemble_weights", ensemble_weights, ENSEMBLE_WEIGHTS_VERSION, models_path)
+            logging.info("Ensemble weights — demand XGB: %.2f, revenue XGB: %.2f", w_dem, w_rev)
+        except Exception as exc:
+            logging.warning("Ensemble weight computation failed: %s", exc)
+            results["ensemble_weights"] = {"demand": 1.0, "revenue": 1.0}
+
     if _artifact_current("cancel_survival_model", SURVIVAL_MODEL_VERSION, models_dir=models_path):
         results["cancel_survival_model"] = model_cache.load_artifact("cancel_survival_model", models_dir=models_path)
     else:
@@ -349,17 +460,114 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["cancel_survival_model"] = survival_bundle
         _save_versioned("cancel_survival_model", survival_bundle, SURVIVAL_MODEL_VERSION, models_path)
 
+    # ------------------------------------------------------------------
+    # Per-hotel-type segmented models (Track 1 + Track 2)
+    # ------------------------------------------------------------------
+    hotel_daily_map = aggregate_daily_by_hotel_type(df)
+    results["hotel_types_available"] = list(hotel_daily_map.keys())
+
+    for hotel_type, hotel_daily_df in hotel_daily_map.items():
+        slug = _hotel_slug(hotel_type)
+        hotel_df_scored = df_with_expected_revenue[df_with_expected_revenue["hotel"] == hotel_type]
+        h_rev_daily = aggregate_daily(hotel_df_scored)
+        try:
+            otb_matrix_hotel = build_otb_feature_matrix(
+                df[df["hotel"] == hotel_type], lead_times=[30, 60]
+            )[["otb_30d", "otb_60d"]]
+        except Exception as exc:
+            logging.warning("OTB-30d matrix failed for '%s': %s", hotel_type, exc)
+            otb_matrix_hotel = pd.DataFrame()
+
+        def _hotel_extra(series_index):
+            frames = []
+            if not otb_matrix_hotel.empty:
+                frames.append(otb_matrix_hotel.reindex(series_index).fillna(0))
+            if not weather_matrix.empty:
+                frames.append(weather_matrix.reindex(series_index).fillna(0))
+            if not frames:
+                return None
+            return frames[0] if len(frames) == 1 else pd.concat(frames, axis=1)
+
+        hotel_rev_specs = [
+            (f"xgb_revenue_{slug}", f"xgb_revenue_intervals_{slug}",
+             "daily_booked_revenue", "booked revenue"),
+            (f"xgb_realized_revenue_{slug}", f"xgb_realized_revenue_intervals_{slug}",
+             "daily_realized_revenue", "realized revenue"),
+            (f"xgb_expected_revenue_{slug}", f"xgb_expected_revenue_intervals_{slug}",
+             "daily_expected_realized_revenue", "expected realized revenue"),
+        ]
+        for xgb_key, interval_key, column, label in hotel_rev_specs:
+            try:
+                h_series = _validated_forecast_series(h_rev_daily, column,
+                                                      f"{dataset_id}_{slug}", label)
+            except ValueError:
+                continue
+            _h_extra = _hotel_extra(h_series.index)
+
+            if _artifact_current(xgb_key, SEGMENTED_MODEL_VERSION, models_dir=models_path):
+                results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
+            else:
+                best_p = tune_xgb_forecaster(h_series, lags=FORECAST_LAGS,
+                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+                xgb_m, xgb_cols = train_xgb_forecaster(h_series, lags=FORECAST_LAGS,
+                                                        extra_features=_h_extra, **best_p)
+                results[xgb_key] = (xgb_m, xgb_cols)
+                _save_versioned(xgb_key, (xgb_m, xgb_cols), SEGMENTED_MODEL_VERSION, models_path)
+
+            if _artifact_current(interval_key, SEGMENTED_INTERVAL_VERSION, models_dir=models_path):
+                results[interval_key] = model_cache.load_artifact(interval_key, models_dir=models_path)
+            else:
+                best_p = tune_xgb_forecaster(h_series, lags=FORECAST_LAGS,
+                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+                imodels = train_xgb_forecaster_with_intervals(h_series, lags=FORECAST_LAGS,
+                                                              extra_features=_h_extra, **best_p)
+                results[interval_key] = imodels
+                _save_versioned(interval_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
+
+        dem_key = f"xgb_demand_{slug}"
+        dem_int_key = f"xgb_demand_intervals_{slug}"
+        try:
+            h_dem = _validated_forecast_series(hotel_daily_df, "daily_bookings",
+                                               f"{dataset_id}_{slug}", "booking")
+        except ValueError:
+            continue
+        _h_extra_dem = _hotel_extra(h_dem.index)
+
+        if _artifact_current(dem_key, SEGMENTED_MODEL_VERSION, models_dir=models_path):
+            results[dem_key] = model_cache.load_artifact(dem_key, models_dir=models_path)
+        else:
+            best_p = tune_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            xgb_d, xgb_d_cols = train_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
+                                                       extra_features=_h_extra_dem, **best_p)
+            results[dem_key] = (xgb_d, xgb_d_cols)
+            _save_versioned(dem_key, (xgb_d, xgb_d_cols), SEGMENTED_MODEL_VERSION, models_path)
+
+        if _artifact_current(dem_int_key, SEGMENTED_INTERVAL_VERSION, models_dir=models_path):
+            results[dem_int_key] = model_cache.load_artifact(dem_int_key, models_dir=models_path)
+        else:
+            best_p = tune_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            imodels = train_xgb_forecaster_with_intervals(h_dem, lags=FORECAST_LAGS,
+                                                          extra_features=_h_extra_dem, **best_p)
+            results[dem_int_key] = imodels
+            _save_versioned(dem_int_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
+
     required_eval_keys = {
         "demand_xgb",
+        "demand_xgb_baseline",
         "demand_prophet",
         "demand_naive",
         "revenue_booked_xgb",
+        "revenue_booked_xgb_baseline",
         "revenue_booked_prophet",
         "revenue_booked_naive",
         "revenue_realized_xgb",
+        "revenue_realized_xgb_baseline",
         "revenue_realized_prophet",
         "revenue_realized_naive",
         "revenue_expected_xgb",
+        "revenue_expected_xgb_baseline",
         "revenue_expected_prophet",
         "revenue_expected_naive",
         "cv_scores",
@@ -375,17 +583,38 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
 
         dem_train = dem_series.iloc[:-test_days]
         dem_test = dem_series.iloc[-test_days:]
-        xgb_dem_m, xgb_dem_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS)
+
+        # OTB + weather features aligned to training split (no leakage — only uses train dates)
+        _otb_eval = _combined_extra(dem_train.index)
+
+        # Baseline (fixed default hyperparameters, no OTB)
+        xgb_base_m, xgb_base_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS)
+        dem_base_preds = forecast_xgb(xgb_base_m, xgb_base_c, dem_train, len(dem_test))
+        dem_base_preds.index = dem_test.index
+
+        # Tuned hyperparameters + OTB features (matches production model)
+        dem_best_p = tune_xgb_forecaster(dem_train, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+        xgb_dem_m, xgb_dem_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS,
+                                                      extra_features=_otb_eval, **dem_best_p)
         dem_xgb_preds = forecast_xgb(xgb_dem_m, xgb_dem_c, dem_train, len(dem_test))
         dem_xgb_preds.index = dem_test.index
+
         dem_naive = naive_baseline_forecast(dem_train, len(dem_test))
         dem_naive.index = dem_test.index
         dem_prophet_df = forecast_prophet(train_prophet_forecaster(dem_train), len(dem_test))
 
+        # Ensemble blend for demand
+        _dem_w = find_ensemble_weights(dem_xgb_preds.values, dem_prophet_df["yhat"].values, dem_test.values)
+        dem_ensemble = blend_forecasts(dem_xgb_preds, dem_prophet_df, _dem_w)
+
         eval_metrics = {
+            "demand_xgb_baseline": regression_metrics(dem_test.values, dem_base_preds.values),
             "demand_xgb": regression_metrics(dem_test.values, dem_xgb_preds.values),
             "demand_prophet": regression_metrics(dem_test.values, dem_prophet_df["yhat"].values),
             "demand_naive": regression_metrics(dem_test.values, dem_naive.values),
+            "demand_ensemble": regression_metrics(dem_test.values, dem_ensemble.values),
+            "demand_ensemble_xgb_weight": _dem_w,
         }
 
         for metric_xgb, metric_prophet, metric_naive, column in revenue_eval_specs:
@@ -393,16 +622,62 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             rev_train = revenue_series.iloc[:-test_days]
             rev_test = revenue_series.iloc[-test_days:]
 
-            xgb_rev_m, xgb_rev_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS)
+            # OTB + weather features aligned to this revenue series' training split
+            _otb_rev_eval = _combined_extra(rev_train.index)
+
+            # Baseline (no OTB)
+            xgb_rev_base, xgb_rev_base_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS)
+            rev_base_preds = forecast_xgb(xgb_rev_base, xgb_rev_base_c, rev_train, len(rev_test))
+            rev_base_preds.index = rev_test.index
+
+            # Tuned + OTB (matches production model)
+            rev_best_p = tune_xgb_forecaster(rev_train, lags=FORECAST_LAGS,
+                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            xgb_rev_m, xgb_rev_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS,
+                                                          extra_features=_otb_rev_eval, **rev_best_p)
             rev_xgb_preds = forecast_xgb(xgb_rev_m, xgb_rev_c, rev_train, len(rev_test))
             rev_xgb_preds.index = rev_test.index
+
             rev_naive = naive_baseline_forecast(rev_train, len(rev_test))
             rev_naive.index = rev_test.index
             rev_prophet_df = forecast_prophet(train_prophet_forecaster(rev_train), len(rev_test))
 
+            _rev_w = find_ensemble_weights(rev_xgb_preds.values, rev_prophet_df["yhat"].values, rev_test.values)
+            rev_ensemble = blend_forecasts(rev_xgb_preds, rev_prophet_df, _rev_w)
+            eval_metrics[f"{metric_xgb}_baseline"] = regression_metrics(rev_test.values, rev_base_preds.values)
             eval_metrics[metric_xgb] = regression_metrics(rev_test.values, rev_xgb_preds.values)
             eval_metrics[metric_prophet] = regression_metrics(rev_test.values, rev_prophet_df["yhat"].values)
             eval_metrics[metric_naive] = regression_metrics(rev_test.values, rev_naive.values)
+            eval_metrics[f"{metric_xgb}_ensemble"] = regression_metrics(rev_test.values, rev_ensemble.values)
+
+        # Per-hotel-type eval metrics
+        _hotel_rev_col_map = {
+            "demand":           ("daily_bookings",               "demand_xgb"),
+            "revenue_booked":   ("daily_booked_revenue",         "revenue_booked_xgb"),
+            "revenue_realized": ("daily_realized_revenue",       "revenue_realized_xgb"),
+            "revenue_expected": ("daily_expected_realized_revenue", "revenue_expected_xgb"),
+        }
+        for hotel_type, hotel_daily_df in hotel_daily_map.items():
+            slug = _hotel_slug(hotel_type)
+            hotel_df_scored2 = df_with_expected_revenue[df_with_expected_revenue["hotel"] == hotel_type]
+            h_rev_daily2 = aggregate_daily(hotel_df_scored2)
+            for metric_prefix, (column, _) in _hotel_rev_col_map.items():
+                src_df = hotel_daily_df if column == "daily_bookings" else h_rev_daily2
+                try:
+                    h_s = _validated_forecast_series(src_df, column, f"{dataset_id}_{slug}", metric_prefix)
+                except ValueError:
+                    continue
+                if len(h_s) <= test_days:
+                    continue
+                h_train = h_s.iloc[:-test_days]
+                h_test = h_s.iloc[-test_days:]
+                h_best_p = tune_xgb_forecaster(h_train, lags=FORECAST_LAGS,
+                                               n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+                h_m, h_c = train_xgb_forecaster(h_train, lags=FORECAST_LAGS,
+                                                extra_features=_combined_extra(h_train.index), **h_best_p)
+                h_preds = forecast_xgb(h_m, h_c, h_train, len(h_test))
+                h_preds.index = h_test.index
+                eval_metrics[f"{metric_prefix}_xgb_{slug}"] = regression_metrics(h_test.values, h_preds.values)
 
         eval_metrics["cv_scores"] = ts_cross_val_scores(
             revenue_series_lookup["daily_booked_revenue"],

@@ -1,7 +1,15 @@
+import logging
+
 import pandas as pd
 import pytest
 from src.preprocessing import load_data, clean_data, engineer_features
-from src.time_series import build_arrival_date, aggregate_daily, expand_stay_nights, aggregate_stay_nights
+from src.time_series import (
+    aggregate_daily,
+    aggregate_daily_by_hotel_type,
+    build_arrival_date,
+    expand_stay_nights,
+    aggregate_stay_nights,
+)
 
 @pytest.fixture(scope="module")
 def df():
@@ -113,6 +121,79 @@ def test_duplicate_rows_do_not_inflate_daily_metrics():
     assert len(cleaned) == 2
     assert daily.loc[pd.Timestamp("2024-01-01"), "daily_bookings"] == 1
     assert daily.loc[pd.Timestamp("2024-01-01"), "daily_booked_revenue"] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# aggregate_daily_by_hotel_type tests
+# ---------------------------------------------------------------------------
+
+def _make_hotel_df(n_resort=40, n_city=40):
+    """Synthetic booking-level DataFrame with two hotel types."""
+    resort_dates = pd.date_range("2022-01-01", periods=n_resort, freq="D")
+    city_dates = pd.date_range("2022-01-01", periods=n_city, freq="D")
+    resort = pd.DataFrame({
+        "arrival_date": resort_dates,
+        "hotel": "Resort Hotel",
+        "is_canceled": 0,
+        "adr": 120.0,
+        "stays_in_weekend_nights": 1,
+        "stays_in_week_nights": 1,
+    })
+    city = pd.DataFrame({
+        "arrival_date": city_dates,
+        "hotel": "City Hotel",
+        "is_canceled": 0,
+        "adr": 90.0,
+        "stays_in_weekend_nights": 1,
+        "stays_in_week_nights": 1,
+    })
+    return pd.concat([resort, city], ignore_index=True)
+
+
+def test_aggregate_daily_by_hotel_type_returns_both_types():
+    df = _make_hotel_df()
+    result = aggregate_daily_by_hotel_type(df)
+    assert "Resort Hotel" in result
+    assert "City Hotel" in result
+
+
+def test_aggregate_daily_by_hotel_type_schema_matches():
+    df = _make_hotel_df()
+    combined = aggregate_daily(df)
+    result = aggregate_daily_by_hotel_type(df)
+    for daily in result.values():
+        assert set(daily.columns) == set(combined.columns)
+
+
+def test_aggregate_daily_by_hotel_type_skips_insufficient_history(caplog):
+    df = _make_hotel_df(n_resort=5, n_city=40)  # Resort has only 5 days — below default 31
+    with caplog.at_level(logging.WARNING, logger="root"):
+        result = aggregate_daily_by_hotel_type(df)
+    assert "Resort Hotel" not in result
+    assert "City Hotel" in result
+    assert any("Resort Hotel" in m for m in caplog.messages)
+
+
+def test_aggregate_daily_by_hotel_type_no_hotel_column(caplog):
+    df = pd.DataFrame({
+        "arrival_date": pd.date_range("2022-01-01", periods=10),
+        "is_canceled": 0,
+        "adr": 100.0,
+        "stays_in_weekend_nights": 1,
+        "stays_in_week_nights": 1,
+    })
+    with caplog.at_level(logging.WARNING, logger="root"):
+        result = aggregate_daily_by_hotel_type(df)
+    assert result == {}
+
+
+def test_aggregate_daily_by_hotel_type_no_gaps():
+    """Each per-type daily DataFrame must have no date gaps."""
+    df = _make_hotel_df()
+    result = aggregate_daily_by_hotel_type(df)
+    for daily in result.values():
+        expected_len = (daily.index.max() - daily.index.min()).days + 1
+        assert len(daily) == expected_len
 
 
 # ---------------------------------------------------------------------------

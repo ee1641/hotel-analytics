@@ -63,8 +63,8 @@ def tune_xgb_cancellation(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
     scale_pos_weight: float,
-    n_iter: int = 10,
-    cv: int = 3,
+    n_iter: int = 20,
+    cv: int = 4,
 ) -> dict:
     """
     Run RandomizedSearchCV over XGBoost hyperparameters.
@@ -72,11 +72,14 @@ def tune_xgb_cancellation(
     Uses n_jobs=-1 for parallel fold evaluation.
     """
     param_dist = {
-        "n_estimators": [100, 200, 400, 600],
-        "max_depth": [4, 6, 8],
-        "learning_rate": [0.01, 0.05, 0.1],
+        "n_estimators": [200, 400, 600, 800],
+        "max_depth": [4, 5, 6, 8],
+        "learning_rate": [0.01, 0.03, 0.05, 0.1],
         "subsample": [0.8, 0.9, 1.0],
         "colsample_bytree": [0.8, 0.9, 1.0],
+        "min_child_weight": [1, 3, 5],
+        "gamma": [0, 0.1, 0.2],
+        "reg_alpha": [0, 0.1, 0.5],
     }
     base = XGBClassifier(
         eval_metric="logloss",

@@ -31,6 +31,62 @@ def resolve_lags(lags: list | None, series_length: int) -> list[int]:
     raise ValueError("Forecasting requires at least 2 observations.")
 
 
+def _easter_sunday(year: int) -> pd.Timestamp:
+    """Anonymous Gregorian algorithm for Easter Sunday."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    el = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * el) // 451
+    month = (h + el - 7 * m + 114) // 31
+    day = ((h + el - 7 * m + 114) % 31) + 1
+    return pd.Timestamp(year=year, month=month, day=day)
+
+
+def _school_holiday_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Portuguese school holiday indicators.
+    Returns DataFrame with is_summer_holiday, is_easter_holiday, is_christmas_holiday.
+    """
+    result = pd.DataFrame(index=index)
+    is_summer = pd.Series(False, index=index)
+    is_easter = pd.Series(False, index=index)
+    is_christmas = pd.Series(False, index=index)
+
+    for year in range(index.min().year - 1, index.max().year + 2):
+        # Summer: mid-June to mid-September
+        summer_start = pd.Timestamp(year=year, month=6, day=15)
+        summer_end   = pd.Timestamp(year=year, month=9, day=15)
+        is_summer |= (index >= summer_start) & (index <= summer_end)
+
+        # Easter: 10 days before Easter Sunday through 7 days after
+        try:
+            easter = _easter_sunday(year)
+            easter_start = easter - pd.Timedelta(days=10)
+            easter_end   = easter + pd.Timedelta(days=7)
+            is_easter |= (index >= easter_start) & (index <= easter_end)
+        except Exception:
+            pass
+
+        # Christmas / New Year: Dec 20 – Jan 3
+        xmas_start = pd.Timestamp(year=year, month=12, day=20)
+        xmas_end   = pd.Timestamp(year=year + 1, month=1, day=3)
+        is_christmas |= (index >= xmas_start) & (index <= xmas_end)
+
+    result["is_summer_holiday"]   = is_summer.astype(int)
+    result["is_easter_holiday"]   = is_easter.astype(int)
+    result["is_christmas_holiday"] = is_christmas.astype(int)
+    result["is_school_holiday"]   = (is_summer | is_easter | is_christmas).astype(int)
+    return result
+
+
 def _holiday_index(index: pd.DatetimeIndex, holiday_country: str | None = None) -> np.ndarray:
     country = holiday_country or APP_CONFIG.get("holiday_country", "PT")
     try:
@@ -100,7 +156,8 @@ def make_calendar_features(
     df["week_cos"] = np.cos(2 * np.pi * week / 52.0)
 
     holiday_df = _holiday_distance_features(index, holiday_country=holiday_country)
-    return pd.concat([df, holiday_df], axis=1)
+    school_df = _school_holiday_features(index)
+    return pd.concat([df, holiday_df, school_df], axis=1)
 
 
 def make_lag_features(
@@ -146,6 +203,80 @@ def make_lag_features(
     return df
 
 
+def tune_xgb_forecaster(
+    series: pd.Series,
+    lags: list | None = None,
+    n_iter: int | None = None,
+    n_splits: int | None = None,
+    holiday_country: str | None = None,
+) -> dict:
+    """
+    Find the best XGBoost hyperparameters for a daily time series using
+    expanding-window time-series cross-validation.
+
+    Tries `n_iter` random parameter combinations, evaluating each with
+    `TimeSeriesSplit(n_splits)` folds.  Returns the param dict that achieves
+    the lowest mean-fold MAE, ready to be unpacked into train_xgb_forecaster.
+    Falls back to safe defaults if anything goes wrong.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+    from src.model_specs import FORECAST_TUNE_N_ITER, FORECAST_TUNE_N_SPLITS
+
+    _n_iter = n_iter if n_iter is not None else FORECAST_TUNE_N_ITER
+    _n_splits = n_splits if n_splits is not None else FORECAST_TUNE_N_SPLITS
+
+    _defaults = {"n_estimators": 300, "max_depth": 5, "learning_rate": 0.05,
+                 "subsample": 0.9, "colsample_bytree": 0.9}
+
+    try:
+        df = make_lag_features(series, lags=lags, holiday_country=holiday_country)
+        feat_cols = [c for c in df.columns if c != "target"]
+        X = df[feat_cols].values
+        y = df["target"].values
+
+        if len(X) < _n_splits * 30:
+            return _defaults
+
+        param_grid = {
+            "n_estimators": [200, 400, 600],
+            "max_depth": [3, 4, 5, 6],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1],
+            "subsample": [0.8, 0.9, 1.0],
+            "colsample_bytree": [0.8, 0.9, 1.0],
+        }
+
+        rng = np.random.RandomState(42)
+        candidates = [
+            {k: rng.choice(v) for k, v in param_grid.items()}
+            for _ in range(_n_iter)
+        ]
+
+        tscv = TimeSeriesSplit(n_splits=_n_splits)
+        best_params = _defaults
+        best_mae = float("inf")
+
+        for params in candidates:
+            fold_maes = []
+            for train_idx, val_idx in tscv.split(X):
+                model = XGBRegressor(
+                    **params,
+                    objective="reg:squarederror",
+                    random_state=42,
+                    verbosity=0,
+                )
+                model.fit(X[train_idx], y[train_idx])
+                preds = model.predict(X[val_idx])
+                fold_maes.append(float(np.mean(np.abs(y[val_idx] - preds))))
+            avg_mae = float(np.mean(fold_maes))
+            if avg_mae < best_mae:
+                best_mae = avg_mae
+                best_params = params
+
+        return best_params
+    except Exception:
+        return _defaults
+
+
 def train_xgb_forecaster(
     series: pd.Series,
     lags: list | None = None,
@@ -154,6 +285,7 @@ def train_xgb_forecaster(
     learning_rate: float = 0.05,
     extra_features: pd.DataFrame | None = None,
     holiday_country: str | None = None,
+    **kwargs,
 ):
     """
     Train an XGBoost regressor on lag, rolling, calendar, holiday, and optional extra features.
@@ -171,11 +303,11 @@ def train_xgb_forecaster(
     feat_cols = [c for c in df.columns if c != "target"]
 
     model = XGBRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        subsample=0.9,
-        colsample_bytree=0.9,
+        n_estimators=kwargs.get("n_estimators", n_estimators),
+        max_depth=kwargs.get("max_depth", max_depth),
+        learning_rate=kwargs.get("learning_rate", learning_rate),
+        subsample=kwargs.get("subsample", 0.9),
+        colsample_bytree=kwargs.get("colsample_bytree", 0.9),
         objective="reg:squarederror",
         random_state=42,
         verbosity=0,
@@ -280,6 +412,7 @@ def train_xgb_direct_multistep(
     horizons: int = 30,
     lags: list | None = None,
     holiday_country: str | None = None,
+    **kwargs,
 ) -> list[tuple[XGBRegressor, list]]:
     """
     Train one XGBRegressor per forecast horizon 1..horizons.
@@ -298,11 +431,11 @@ def train_xgb_direct_multistep(
         y_h = shifted_target.loc[valid_idx].values
         feat_cols = [c for c in df_h.columns if c != "target"]
         model = XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
+            n_estimators=kwargs.get("n_estimators", 300),
+            max_depth=kwargs.get("max_depth", 5),
+            learning_rate=kwargs.get("learning_rate", 0.05),
+            subsample=kwargs.get("subsample", 0.9),
+            colsample_bytree=kwargs.get("colsample_bytree", 0.9),
             objective="reg:squarederror",
             random_state=42,
             verbosity=0,
@@ -383,6 +516,48 @@ def naive_baseline_forecast(series: pd.Series, periods: int = 30) -> pd.Series:
     return pd.Series(predictions, index=future_dates, name="naive_baseline")
 
 
+def find_ensemble_weights(
+    xgb_preds: np.ndarray | list,
+    prophet_preds: np.ndarray | list,
+    actuals: np.ndarray | list,
+) -> float:
+    """
+    Grid-search the XGBoost weight w in the blend: w * XGB + (1-w) * Prophet.
+    Optimises mean absolute error on the provided validation window.
+    Returns the weight (0.0 – 1.0) that minimises MAE.
+    """
+    xgb_arr     = np.asarray(xgb_preds, dtype=float)
+    prophet_arr = np.asarray(prophet_preds, dtype=float)
+    actual_arr  = np.asarray(actuals, dtype=float)
+
+    best_w, best_mae = 1.0, float("inf")
+    for w in np.arange(0.0, 1.01, 0.05):
+        blend = w * xgb_arr + (1.0 - w) * prophet_arr
+        mae = float(np.mean(np.abs(blend - actual_arr)))
+        if mae < best_mae:
+            best_mae = mae
+            best_w = float(w)
+    return best_w
+
+
+def blend_forecasts(
+    xgb_forecast: pd.Series,
+    prophet_forecast: pd.Series | pd.DataFrame,
+    xgb_weight: float,
+) -> pd.Series:
+    """
+    Weighted blend of XGBoost and Prophet forecasts.
+    prophet_forecast may be a Series or a DataFrame with a 'yhat' column.
+    """
+    if isinstance(prophet_forecast, pd.DataFrame) and "yhat" in prophet_forecast.columns:
+        prophet_values = prophet_forecast["yhat"].values
+    else:
+        prophet_values = np.asarray(prophet_forecast, dtype=float)
+
+    blended = xgb_weight * xgb_forecast.values + (1.0 - xgb_weight) * prophet_values
+    return pd.Series(blended, index=xgb_forecast.index, name="forecast_ensemble")
+
+
 def train_prophet_forecaster(
     series: pd.Series,
     holiday_country: str | None = None,
@@ -426,6 +601,7 @@ def train_xgb_forecaster_with_intervals(
     quantiles: tuple = FORECAST_QUANTILES,
     extra_features: pd.DataFrame | None = None,
     holiday_country: str | None = None,
+    **kwargs,
 ) -> dict:
     """
     Train XGBoost models at specified quantiles (p10, p50, p90).
@@ -447,11 +623,11 @@ def train_xgb_forecaster_with_intervals(
     label_map = {0.1: "q10", 0.5: "q50", 0.9: "q90"}
     for q in quantiles:
         model = XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
+            n_estimators=kwargs.get("n_estimators", 300),
+            max_depth=kwargs.get("max_depth", 5),
+            learning_rate=kwargs.get("learning_rate", 0.05),
+            subsample=kwargs.get("subsample", 0.9),
+            colsample_bytree=kwargs.get("colsample_bytree", 0.9),
             objective="reg:quantileerror",
             quantile_alpha=q,
             random_state=42,

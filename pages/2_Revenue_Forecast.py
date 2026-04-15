@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app import get_or_train_models, load_and_prepare_data
 from src.config import APP_CONFIG
 from src.forecasting import (
+    blend_forecasts,
     forecast_prophet,
     forecast_xgb,
     forecast_xgb_direct,
@@ -30,6 +31,8 @@ from src.revenue_management import (
     fit_price_elasticity_models,
     recommend_dynamic_prices,
 )
+from src.weather import build_inference_weather
+from src.time_series import aggregate_daily
 from src.time_series import aggregate_stay_nights, expand_stay_nights
 
 st.set_page_config(page_title="Revenue Forecast", page_icon="📈", layout="wide")
@@ -75,6 +78,26 @@ snapshot_date = pd.Timestamp(
     )
 )
 
+_hotel_type_options = ["All hotels (combined)"] + models.get("hotel_types_available", [])
+hotel_type_choice = st.sidebar.selectbox("Hotel type", _hotel_type_options, index=0)
+
+# Resolve series DataFrame and df slice based on hotel type selection
+if hotel_type_choice == "All hotels (combined)":
+    _slug_suffix = ""
+    _series_source_df = models.get("daily_revenue_views", daily_df)
+    _df_for_pickup = df
+else:
+    _slug = hotel_type_choice.lower().replace(" ", "_")
+    _slug_suffix = f"_{_slug}"
+    _hotel_mask = df["hotel"] == hotel_type_choice
+    _df_for_pickup = df[_hotel_mask]
+    _series_source_df = aggregate_daily(_df_for_pickup)
+    if _series_source_df.empty:
+        st.info(f"No booking data found for '{hotel_type_choice}'. Showing combined model.")
+        _slug_suffix = ""
+        _series_source_df = models.get("daily_revenue_views", daily_df)
+        _df_for_pickup = df
+
 col_ctrl1, col_ctrl2 = st.columns(2)
 with col_ctrl1:
     series_choice = st.radio("Series", ["Revenue", "Demand"], horizontal=True)
@@ -87,53 +110,61 @@ if series_choice == "Revenue":
         ["Booked Revenue", "Realized Revenue", "Expected Realized Revenue"],
         horizontal=True,
     )
-    revenue_config = {
+    _base_configs = {
         "Booked Revenue": {
             "column": "daily_booked_revenue",
             "label": "Booked Revenue (€)",
-            "xgb_key": "xgb_revenue",
-            "direct_key": "xgb_revenue_direct",
-            "interval_key": "xgb_revenue_intervals",
+            "xgb_base": "xgb_revenue",
+            "direct_base": "xgb_revenue_direct",
+            "interval_base": "xgb_revenue_intervals",
             "prophet_key": "prophet_revenue",
             "metrics": ("revenue_booked_xgb", "revenue_booked_prophet", "revenue_booked_naive"),
         },
         "Realized Revenue": {
             "column": "daily_realized_revenue",
             "label": "Realized Revenue (€)",
-            "xgb_key": "xgb_realized_revenue",
-            "direct_key": "xgb_realized_revenue_direct",
-            "interval_key": "xgb_realized_revenue_intervals",
+            "xgb_base": "xgb_realized_revenue",
+            "direct_base": "xgb_realized_revenue_direct",
+            "interval_base": "xgb_realized_revenue_intervals",
             "prophet_key": "prophet_realized_revenue",
             "metrics": ("revenue_realized_xgb", "revenue_realized_prophet", "revenue_realized_naive"),
         },
         "Expected Realized Revenue": {
             "column": "daily_expected_realized_revenue",
             "label": "Expected Realized Revenue (€)",
-            "xgb_key": "xgb_expected_revenue",
-            "direct_key": "xgb_expected_revenue_direct",
-            "interval_key": "xgb_expected_revenue_intervals",
+            "xgb_base": "xgb_expected_revenue",
+            "direct_base": "xgb_expected_revenue_direct",
+            "interval_base": "xgb_expected_revenue_intervals",
             "prophet_key": "prophet_expected_revenue",
             "metrics": ("revenue_expected_xgb", "revenue_expected_prophet", "revenue_expected_naive"),
         },
     }[revenue_type]
 
-    series = daily_df[revenue_config["column"]]
-    y_label = revenue_config["label"]
-    xgb_key = revenue_config["xgb_key"]
-    direct_key = revenue_config["direct_key"]
-    interval_key = revenue_config["interval_key"]
-    prophet_key = revenue_config["prophet_key"]
-    xgb_metric_key, prophet_metric_key, naive_key = revenue_config["metrics"]
+    _col = _base_configs["column"]
+    series = _series_source_df[_col] if _col in _series_source_df.columns else daily_df[_col]
+    y_label = _base_configs["label"]
+    xgb_key = _base_configs["xgb_base"] + _slug_suffix
+    direct_key = _base_configs["direct_base"] + _slug_suffix
+    interval_key = _base_configs["interval_base"] + _slug_suffix
+    prophet_key = _base_configs["prophet_key"]
+    xgb_metric_key, prophet_metric_key, naive_key = _base_configs["metrics"]
     forecast_title = f"30-Day {revenue_type} Forecast"
 else:
-    series = daily_df["daily_bookings"]
+    series = _series_source_df["daily_bookings"] if "daily_bookings" in _series_source_df.columns else daily_df["daily_bookings"]
     y_label = "Bookings"
-    xgb_key = "xgb_demand"
-    direct_key = "xgb_demand_direct"
-    interval_key = "xgb_demand_intervals"
+    xgb_key = "xgb_demand" + _slug_suffix
+    direct_key = "xgb_demand_direct" + _slug_suffix
+    interval_key = "xgb_demand_intervals" + _slug_suffix
     prophet_key = "prophet_demand"
     xgb_metric_key, prophet_metric_key, naive_key = "demand_xgb", "demand_prophet", "demand_naive"
     forecast_title = "30-Day Demand Forecast"
+
+# Fall back to combined model if per-type model is unavailable
+if models.get(xgb_key) is None and _slug_suffix:
+    st.info(f"Per-type model for '{hotel_type_choice}' is not yet available; using combined model.")
+    xgb_key = xgb_key.replace(_slug_suffix, "")
+    interval_key = interval_key.replace(_slug_suffix, "")
+    direct_key = direct_key.replace(_slug_suffix, "")
 
 xgb_model, feat_cols = models[xgb_key]
 prophet_model = models[prophet_key]
@@ -169,12 +200,85 @@ if model_choice != "Naive Baseline":
     else:
         st.warning(f"{model_choice} trails the seasonal naive baseline by **{abs(improvement):.1f} MAPE points**.")
 
+_tuning_rows = [
+    ("Demand",                   "demand_xgb_baseline",           "demand_xgb"),
+    ("Booked Revenue",           "revenue_booked_xgb_baseline",   "revenue_booked_xgb"),
+    ("Realized Revenue",         "revenue_realized_xgb_baseline", "revenue_realized_xgb"),
+    ("Expected Realized Rev.",   "revenue_expected_xgb_baseline", "revenue_expected_xgb"),
+]
+_has_tuning_data = all(eval_metrics.get(b) and eval_metrics.get(t) for _, b, t in _tuning_rows)
+if _has_tuning_data:
+    with st.expander("Tuning Improvement — before vs. after hyperparameter search"):
+        st.caption(
+            "Each XGBoost forecaster was re-evaluated on the same 30-day holdout using "
+            "fixed default params (Default) and time-series CV-tuned params (Tuned). "
+            "Lower MAPE is better."
+        )
+        _table_data = []
+        for label, baseline_key, tuned_key in _tuning_rows:
+            b_mape = eval_metrics[baseline_key]["mape"]
+            t_mape = eval_metrics[tuned_key]["mape"]
+            gain = t_mape - b_mape
+            _table_data.append({
+                "Series": label,
+                "Default MAPE": f"{b_mape:.1f}%",
+                "Tuned MAPE": f"{t_mape:.1f}%",
+                "Gain (pts)": f"{gain:+.1f}",
+            })
+        _tuning_df = pd.DataFrame(_table_data)
+
+        def _color_gain(val):
+            try:
+                v = float(val.replace("+", ""))
+                color = "green" if v < 0 else ("red" if v > 0 else "gray")
+            except Exception:
+                color = "gray"
+            return f"color: {color}; font-weight: bold"
+
+        st.dataframe(
+            _tuning_df.style.applymap(_color_gain, subset=["Gain (pts)"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
 st.divider()
 
 st.subheader(forecast_title)
 history_window = series.iloc[-90:]
 show_ci = False
 band_df = None
+
+# Build otb_30d and otb_60d future features for inference.
+# otb_30d: active bookings as of snapshot  → matches training snapshot at d-30
+# otb_60d: active bookings as of snapshot-30 → matches training snapshot at d-60
+_future_dates_30 = pd.date_range(snapshot_date + pd.Timedelta(days=1), periods=30, freq="D")
+_snapshot_ts = pd.Timestamp(snapshot_date)
+_snapshot_60d_ts = _snapshot_ts - pd.Timedelta(days=30)
+
+def _count_active_otb(data, as_of_ts, future_dates):
+    if "reservation_status_date" in data.columns:
+        _a = data[
+            (data["is_canceled"] == 0) |
+            ((data["is_canceled"] == 1) & (data["reservation_status_date"] > as_of_ts))
+        ]
+    else:
+        _a = data[data["is_canceled"] == 0]
+    return _a.groupby("arrival_date").size().reindex(future_dates, fill_value=0)
+
+_otb_30d_counts = _count_active_otb(_df_for_pickup, _snapshot_ts,    _future_dates_30)
+_otb_60d_counts = _count_active_otb(_df_for_pickup, _snapshot_60d_ts, _future_dates_30)
+_future_otb = pd.DataFrame(
+    {"otb_30d": _otb_30d_counts.values, "otb_60d": _otb_60d_counts.values},
+    index=_future_dates_30,
+)
+
+# Weather features for the 30-day forecast window (Live API for days 1-16, climatology beyond)
+try:
+    _weather_future = build_inference_weather(_future_dates_30)
+    if not _weather_future.empty:
+        _future_otb = pd.concat([_future_otb, _weather_future.reindex(_future_dates_30).fillna(0)], axis=1)
+except Exception as _we:
+    pass  # forecast proceeds without weather features if API unavailable
 
 if model_choice == "XGBoost":
     direct_models = models.get(direct_key)
@@ -185,16 +289,19 @@ if model_choice == "XGBoost":
             direct_models, series, holiday_country=APP_CONFIG.get("holiday_country")
         )
         if interval_models:
-            band_df = forecast_xgb_with_intervals(interval_models, series, periods=30)
+            band_df = forecast_xgb_with_intervals(interval_models, series, periods=30,
+                                                  future_features=_future_otb)
             band_df["ds"] = pd.to_datetime(band_df["ds"])
             show_ci = True
     elif interval_models:
-        band_df = forecast_xgb_with_intervals(interval_models, series, periods=30)
+        band_df = forecast_xgb_with_intervals(interval_models, series, periods=30,
+                                              future_features=_future_otb)
         band_df["ds"] = pd.to_datetime(band_df["ds"])
         forecast_30 = band_df.set_index("ds")["yhat"].rename("forecast")
         show_ci = True
     else:
-        forecast_30 = forecast_xgb(xgb_model, feat_cols, series, periods=30)
+        forecast_30 = forecast_xgb(xgb_model, feat_cols, series, periods=30,
+                                   future_features=_future_otb)
 elif model_choice == "Prophet":
     band_df = forecast_prophet(prophet_model, periods=30)
     band_df["ds"] = pd.to_datetime(band_df["ds"])
@@ -274,12 +381,11 @@ st.caption(
 )
 
 pickup_report = build_pickup_report(
-    df,
+    _df_for_pickup,
     snapshot_date=snapshot_date,
     periods=30,
     capacity=int(total_rooms),
 )
-
 pickup_cols = st.columns(4)
 pickup_cols[0].metric("Future Dates Shown", str(len(pickup_report)))
 pickup_cols[1].metric("Total OTB", f"{int(pickup_report['otb_today'].sum()):,}")
@@ -334,10 +440,17 @@ def _pricing_models(dataframe: pd.DataFrame):
 
 elasticity_models = _pricing_models(df)
 demand_bands = models.get("xgb_demand_intervals")
+# Slice the bookings history to the snapshot date so the pricing forecast
+# covers the same window as the pickup report (snapshot+1 … snapshot+30).
+bookings_to_snapshot = daily_df["daily_bookings"].loc[: snapshot_date]
+if len(bookings_to_snapshot) < 2:
+    bookings_to_snapshot = daily_df["daily_bookings"]
 if demand_bands:
-    demand_forecast_df = forecast_xgb_with_intervals(demand_bands, daily_df["daily_bookings"], periods=30)
+    demand_forecast_df = forecast_xgb_with_intervals(demand_bands, bookings_to_snapshot, periods=30,
+                                                     future_features=_future_otb)
 else:
-    point_forecast = forecast_xgb(models["xgb_demand"][0], models["xgb_demand"][1], daily_df["daily_bookings"], periods=30)
+    point_forecast = forecast_xgb(models["xgb_demand"][0], models["xgb_demand"][1],
+                                  bookings_to_snapshot, periods=30, future_features=_future_otb)
     demand_forecast_df = pd.DataFrame(
         {
             "ds": point_forecast.index,

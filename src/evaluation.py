@@ -52,7 +52,8 @@ def ts_cross_val_scores(
         train = series.iloc[:train_end]
         test = series.iloc[train_end: train_end + forecast_horizon]
         try:
-            model, feat_cols = train_xgb_forecaster(train, lags=[1, 7, 14, 30])
+            from src.model_specs import FORECAST_LAGS
+            model, feat_cols = train_xgb_forecaster(train, lags=FORECAST_LAGS)
             preds = forecast_xgb(model, feat_cols, train, periods=len(test))
             preds.index = test.index
             m = regression_metrics(test.values, preds.values)
