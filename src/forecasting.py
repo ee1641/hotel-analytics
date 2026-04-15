@@ -275,6 +275,76 @@ def forecast_xgb(
     return pd.Series(predictions, index=future_dates, name="forecast")
 
 
+def train_xgb_direct_multistep(
+    series: pd.Series,
+    horizons: int = 30,
+    lags: list | None = None,
+    holiday_country: str | None = None,
+) -> list[tuple[XGBRegressor, list]]:
+    """
+    Train one XGBRegressor per forecast horizon 1..horizons.
+    Model h is trained to predict the value h days ahead from the last observed
+    day, using only actual historical values as features.
+    Avoids the error accumulation of iterative one-step-ahead forecasting.
+
+    Returns a list of (model, feat_cols) tuples, one per horizon.
+    """
+    models = []
+    for h in range(1, horizons + 1):
+        shifted_target = series.shift(-h)
+        df = make_lag_features(series, lags=lags, holiday_country=holiday_country)
+        valid_idx = df.index[df.index.isin(shifted_target.dropna().index)]
+        df_h = df.loc[valid_idx].copy()
+        y_h = shifted_target.loc[valid_idx].values
+        feat_cols = [c for c in df_h.columns if c != "target"]
+        model = XGBRegressor(
+            n_estimators=300,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            random_state=42,
+            verbosity=0,
+        )
+        model.fit(df_h[feat_cols].values, y_h)
+        models.append((model, feat_cols))
+    return models
+
+
+def forecast_xgb_direct(
+    models: list[tuple[XGBRegressor, list]],
+    history: pd.Series,
+    holiday_country: str | None = None,
+) -> pd.Series:
+    """
+    Direct multi-step forecast using per-horizon models.
+    Each model sees only actual historical values as features — no error accumulation.
+    The `extended` list is never modified, so all 30 predictions use the same
+    historical context.
+    """
+    history = pd.Series(history).sort_index()
+    extended = list(history.values.astype(float))
+    future_dates = pd.date_range(
+        history.index[-1] + pd.Timedelta(days=1),
+        periods=len(models),
+        freq="D",
+    )
+    predictions = []
+    for i, (model, feat_cols) in enumerate(models):
+        row_df = _build_forecast_row(
+            future_dates[i],
+            feat_cols,
+            extended,
+            holiday_country=holiday_country,
+        )
+        pred = float(model.predict(row_df.values)[0])
+        predictions.append(pred)
+        # Key: do NOT append pred to extended.
+        # Every model uses actual historical values only.
+    return pd.Series(predictions, index=future_dates, name="forecast")
+
+
 def train_sarima_forecaster(
     series: pd.Series,
     order: tuple = (1, 1, 1),

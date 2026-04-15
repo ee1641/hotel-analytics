@@ -5,7 +5,9 @@ from src.forecasting import (
     make_lag_features,
     train_xgb_forecaster,
     train_xgb_forecaster_with_intervals,
+    train_xgb_direct_multistep,
     forecast_xgb,
+    forecast_xgb_direct,
     forecast_xgb_with_intervals,
     train_sarima_forecaster,
     forecast_sarima,
@@ -81,3 +83,17 @@ def test_sarima_forecast_length(daily_series):
     result = train_sarima_forecaster(daily_series, order=(1, 1, 1))
     preds = forecast_sarima(result, periods=30)
     assert len(preds) == 30
+
+
+def test_direct_multistep_produces_correct_count(daily_series):
+    models = train_xgb_direct_multistep(daily_series, horizons=5, lags=[1, 7])
+    assert len(models) == 5
+    assert all(isinstance(m, tuple) and len(m) == 2 for m in models)
+
+
+def test_direct_multistep_forecast_no_accumulation(daily_series):
+    models = train_xgb_direct_multistep(daily_series, horizons=5, lags=[1, 7])
+    preds = forecast_xgb_direct(models, daily_series)
+    assert len(preds) == 5
+    assert preds.index[0] > daily_series.index[-1]
+    assert preds.isna().sum() == 0

@@ -34,6 +34,10 @@ _PATHS: dict[str, str] = {
     "prophet_realized_revenue": "prophet_realized_revenue_model.pkl",
     "prophet_expected_revenue": "prophet_expected_revenue_model.pkl",
     "prophet_demand":     "prophet_demand_model.pkl",
+    "xgb_revenue_direct":           "xgb_revenue_direct_forecaster.pkl",
+    "xgb_realized_revenue_direct":  "xgb_realized_revenue_direct_forecaster.pkl",
+    "xgb_expected_revenue_direct":  "xgb_expected_revenue_direct_forecaster.pkl",
+    "xgb_demand_direct":            "xgb_demand_direct_forecaster.pkl",
 }
 
 

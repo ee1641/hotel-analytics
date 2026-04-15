@@ -20,6 +20,7 @@ from src.config import APP_CONFIG
 from src.forecasting import (
     forecast_prophet,
     forecast_xgb,
+    forecast_xgb_direct,
     forecast_xgb_with_intervals,
     naive_baseline_forecast,
 )
@@ -91,6 +92,7 @@ if series_choice == "Revenue":
             "column": "daily_booked_revenue",
             "label": "Booked Revenue (€)",
             "xgb_key": "xgb_revenue",
+            "direct_key": "xgb_revenue_direct",
             "interval_key": "xgb_revenue_intervals",
             "prophet_key": "prophet_revenue",
             "metrics": ("revenue_booked_xgb", "revenue_booked_prophet", "revenue_booked_naive"),
@@ -99,6 +101,7 @@ if series_choice == "Revenue":
             "column": "daily_realized_revenue",
             "label": "Realized Revenue (€)",
             "xgb_key": "xgb_realized_revenue",
+            "direct_key": "xgb_realized_revenue_direct",
             "interval_key": "xgb_realized_revenue_intervals",
             "prophet_key": "prophet_realized_revenue",
             "metrics": ("revenue_realized_xgb", "revenue_realized_prophet", "revenue_realized_naive"),
@@ -107,6 +110,7 @@ if series_choice == "Revenue":
             "column": "daily_expected_realized_revenue",
             "label": "Expected Realized Revenue (€)",
             "xgb_key": "xgb_expected_revenue",
+            "direct_key": "xgb_expected_revenue_direct",
             "interval_key": "xgb_expected_revenue_intervals",
             "prophet_key": "prophet_expected_revenue",
             "metrics": ("revenue_expected_xgb", "revenue_expected_prophet", "revenue_expected_naive"),
@@ -116,6 +120,7 @@ if series_choice == "Revenue":
     series = daily_df[revenue_config["column"]]
     y_label = revenue_config["label"]
     xgb_key = revenue_config["xgb_key"]
+    direct_key = revenue_config["direct_key"]
     interval_key = revenue_config["interval_key"]
     prophet_key = revenue_config["prophet_key"]
     xgb_metric_key, prophet_metric_key, naive_key = revenue_config["metrics"]
@@ -124,6 +129,7 @@ else:
     series = daily_df["daily_bookings"]
     y_label = "Bookings"
     xgb_key = "xgb_demand"
+    direct_key = "xgb_demand_direct"
     interval_key = "xgb_demand_intervals"
     prophet_key = "prophet_demand"
     xgb_metric_key, prophet_metric_key, naive_key = "demand_xgb", "demand_prophet", "demand_naive"
@@ -171,8 +177,18 @@ show_ci = False
 band_df = None
 
 if model_choice == "XGBoost":
+    direct_models = models.get(direct_key)
     interval_models = models.get(interval_key)
-    if interval_models:
+    if direct_models:
+        # Direct multi-step: each horizon uses actual historical values, no error accumulation
+        forecast_30 = forecast_xgb_direct(
+            direct_models, series, holiday_country=APP_CONFIG.get("holiday_country")
+        )
+        if interval_models:
+            band_df = forecast_xgb_with_intervals(interval_models, series, periods=30)
+            band_df["ds"] = pd.to_datetime(band_df["ds"])
+            show_ci = True
+    elif interval_models:
         band_df = forecast_xgb_with_intervals(interval_models, series, periods=30)
         band_df["ds"] = pd.to_datetime(band_df["ds"])
         forecast_30 = band_df.set_index("ds")["yhat"].rename("forecast")

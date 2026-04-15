@@ -27,14 +27,17 @@ from src.evaluation import regression_metrics, ts_cross_val_scores
 from src.forecasting import (
     forecast_prophet,
     forecast_xgb,
+    forecast_xgb_direct,
     naive_baseline_forecast,
     train_prophet_forecaster,
+    train_xgb_direct_multistep,
     train_xgb_forecaster,
     train_xgb_forecaster_with_intervals,
 )
 from src.ingestion import load_cancellation_prediction_csv
 from src.model_specs import (
     CANCELLATION_MODEL_VERSION,
+    DIRECT_FORECAST_MODEL_VERSION,
     EVAL_METRICS_VERSION,
     FORECAST_LAGS,
     FORECAST_MODEL_VERSION,
@@ -107,6 +110,13 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         results["xgb_revenue"] = (xgb_m, xgb_cols)
         _save_versioned("xgb_revenue", (xgb_m, xgb_cols), FORECAST_MODEL_VERSION, models_dir)
 
+    if _artifact_current("xgb_revenue_direct", DIRECT_FORECAST_MODEL_VERSION, models_dir):
+        results["xgb_revenue_direct"] = model_cache.load_artifact("xgb_revenue_direct", models_dir=models_dir)
+    else:
+        direct_rev = train_xgb_direct_multistep(rev_series, lags=FORECAST_LAGS)
+        results["xgb_revenue_direct"] = direct_rev
+        _save_versioned("xgb_revenue_direct", direct_rev, DIRECT_FORECAST_MODEL_VERSION, models_dir)
+
     if _artifact_current("xgb_revenue_intervals", INTERVAL_MODEL_VERSION, models_dir):
         results["xgb_revenue_intervals"] = model_cache.load_artifact("xgb_revenue_intervals", models_dir=models_dir)
     else:
@@ -130,6 +140,13 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS)
         results["xgb_demand"] = (xgb_d, xgb_d_cols)
         _save_versioned("xgb_demand", (xgb_d, xgb_d_cols), FORECAST_MODEL_VERSION, models_dir)
+
+    if _artifact_current("xgb_demand_direct", DIRECT_FORECAST_MODEL_VERSION, models_dir):
+        results["xgb_demand_direct"] = model_cache.load_artifact("xgb_demand_direct", models_dir=models_dir)
+    else:
+        direct_dem = train_xgb_direct_multistep(dem_series, lags=FORECAST_LAGS)
+        results["xgb_demand_direct"] = direct_dem
+        _save_versioned("xgb_demand_direct", direct_dem, DIRECT_FORECAST_MODEL_VERSION, models_dir)
 
     if _artifact_current("xgb_demand_intervals", INTERVAL_MODEL_VERSION, models_dir):
         results["xgb_demand_intervals"] = model_cache.load_artifact("xgb_demand_intervals", models_dir=models_dir)
