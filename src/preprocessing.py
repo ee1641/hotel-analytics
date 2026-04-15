@@ -132,7 +132,7 @@ _LEAKY_COLS = [
 LEAKY_COLUMNS = [
     "reservation_status",        # directly encodes the target
     "reservation_status_date",   # directly encodes the target
-    "deposit_type",              # set after booking confirmation, not at booking time
+    "realized_revenue",          # realized_revenue = revenue × (1 - is_canceled) → 0 for cancellations
     "assigned_room_type",        # assigned at check-in, not at booking time
     "booking_changes",           # accumulated post-booking
     "days_in_waiting_list",      # accumulated post-booking
@@ -187,7 +187,12 @@ def encode_categoricals(df: pd.DataFrame):
     y_cancel = df["is_canceled"].copy()
     y_noshow = df["is_no_show"].copy()
 
-    drop_cols = _LEAKY_COLS + ["is_canceled", "is_no_show", "revenue", "arrival_date"]
+    # realized_revenue and booked_revenue leak the target at booking time:
+    # realized_revenue = revenue * (1 - is_canceled) → 0 for every cancellation
+    drop_cols = _LEAKY_COLS + [
+        "is_canceled", "is_no_show", "revenue", "arrival_date",
+        "realized_revenue", "booked_revenue",
+    ]
     feature_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
     for col in _CATEGORICAL_COLS:

@@ -37,9 +37,16 @@ def test_reservation_status_not_in_X(engineered_df):
     assert "reservation_status" not in X.columns
 
 
-def test_deposit_type_not_in_X(engineered_df):
+def test_deposit_type_in_X(engineered_df):
+    """deposit_type is set at booking time — must be a feature, not dropped."""
     X, _, _ = encode_categoricals(drop_leaky_features(engineered_df))
-    assert "deposit_type" not in X.columns
+    assert "deposit_type" in X.columns
+
+
+def test_realized_revenue_not_in_X(engineered_df):
+    """realized_revenue encodes is_canceled directly — must never reach feature matrix."""
+    X, _, _ = encode_categoricals(drop_leaky_features(engineered_df))
+    assert "realized_revenue" not in X.columns
 
 
 def test_assigned_room_type_not_in_X(engineered_df):
