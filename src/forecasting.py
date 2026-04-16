@@ -184,6 +184,18 @@ def make_lag_features(
     df["rolling_std_28"] = series.shift(1).rolling(28, min_periods=2).std().fillna(0.0)
     df["trend_7"] = series.shift(1).diff(7).fillna(0.0)
 
+    # Booking velocity (demand acceleration) — week-over-week and 2-week changes
+    # Captures whether demand is speeding up or slowing down
+    rm7_now  = series.shift(1).rolling(7, min_periods=1).mean()
+    rm7_prev = series.shift(8).rolling(7, min_periods=1).mean()
+    df["booking_velocity_7"] = (rm7_now - rm7_prev).fillna(0.0)
+
+    rm14_now  = series.shift(1).rolling(14, min_periods=1).mean()
+    rm14_prev = series.shift(15).rolling(14, min_periods=1).mean()
+    df["booking_velocity_14"] = (rm14_now - rm14_prev).fillna(0.0)
+
+    df["booking_accel_sign"] = np.sign(df["booking_velocity_7"]).astype(int)
+
     if "lag_364" in df.columns and "lag_365" in df.columns:
         df["swly_mean"] = df[["lag_364", "lag_365"]].mean(axis=1)
     elif "lag_364" in df.columns:
@@ -199,6 +211,14 @@ def make_lag_features(
         aligned = aligned.fillna(0.0)
         df = pd.concat([df, aligned], axis=1)
 
+    # Interaction features — capture weekday×seasonality effects
+    df["season"] = ((df["month"] % 12) // 3).astype(int)  # 0=winter,1=spring,2=summer,3=autumn
+    df["dow_sin_x_month"] = df["dow_sin"] * df["month"]
+    df["dow_cos_x_month"] = df["dow_cos"] * df["month"]
+    df["is_weekend_x_holiday"] = df["is_weekend"] * df["is_holiday"]
+    df["school_x_weekend"] = df["is_school_holiday"] * df["is_weekend"]
+    df["season_x_is_weekend"] = df["season"] * df["is_weekend"]
+
     df.dropna(inplace=True)
     return df
 
@@ -209,6 +229,7 @@ def tune_xgb_forecaster(
     n_iter: int | None = None,
     n_splits: int | None = None,
     holiday_country: str | None = None,
+    log_target: bool = True,
 ) -> dict:
     """
     Find the best XGBoost hyperparameters for a daily time series using
@@ -229,7 +250,8 @@ def tune_xgb_forecaster(
                  "subsample": 0.9, "colsample_bytree": 0.9}
 
     try:
-        df = make_lag_features(series, lags=lags, holiday_country=holiday_country)
+        tune_series = pd.Series(np.log1p(series.values), index=series.index) if log_target else series
+        df = make_lag_features(tune_series, lags=lags, holiday_country=holiday_country)
         feat_cols = [c for c in df.columns if c != "target"]
         X = df[feat_cols].values
         y = df["target"].values
@@ -280,22 +302,27 @@ def tune_xgb_forecaster(
 def train_xgb_forecaster(
     series: pd.Series,
     lags: list | None = None,
-    n_estimators: int = 300,
+    n_estimators: int = 500,
     max_depth: int = 5,
-    learning_rate: float = 0.05,
+    learning_rate: float = 0.03,
     extra_features: pd.DataFrame | None = None,
     holiday_country: str | None = None,
+    log_target: bool = True,
     **kwargs,
 ):
     """
     Train an XGBoost regressor on lag, rolling, calendar, holiday, and optional extra features.
 
+    When log_target=True (default), the series is log1p-transformed before feature building.
+    model.log_target is set so forecast_xgb can invert the transform automatically.
+
     Returns:
         model      : fitted XGBRegressor
         feat_cols  : list of feature column names (in order)
     """
+    train_series = pd.Series(np.log1p(series.values), index=series.index) if log_target else series
     df = make_lag_features(
-        series,
+        train_series,
         lags=lags,
         extra_features=extra_features,
         holiday_country=holiday_country,
@@ -308,11 +335,15 @@ def train_xgb_forecaster(
         learning_rate=kwargs.get("learning_rate", learning_rate),
         subsample=kwargs.get("subsample", 0.9),
         colsample_bytree=kwargs.get("colsample_bytree", 0.9),
-        objective="reg:squarederror",
+        min_child_weight=kwargs.get("min_child_weight", 3),
+        gamma=kwargs.get("gamma", 0.1),
+        objective="reg:quantileerror",
+        quantile_alpha=0.5,
         random_state=42,
         verbosity=0,
     )
     model.fit(df[feat_cols].values, df["target"].values)
+    model.log_target = log_target
     return model, feat_cols
 
 
@@ -381,10 +412,12 @@ def forecast_xgb(
     """
     Iterative one-step-ahead forecast.
     Calendar and holiday features are computed from the future date.
-    Optional future_features can inject pickup or segment-context features.
+    If model.log_target is True, history is log1p-transformed, predictions accumulate
+    in log-space, and the final output is expm1-inverted back to original scale.
     """
+    log_target = getattr(model, "log_target", False)
     history = pd.Series(history).sort_index()
-    extended = list(history.values.astype(float))
+    extended = list(np.log1p(history.values.astype(float)) if log_target else history.values.astype(float))
     future_dates = pd.date_range(
         history.index[-1] + pd.Timedelta(days=1),
         periods=periods,
@@ -404,7 +437,10 @@ def forecast_xgb(
         predictions.append(pred)
         extended.append(pred)
 
-    return pd.Series(predictions, index=future_dates, name="forecast")
+    preds_array = np.array(predictions)
+    if log_target:
+        preds_array = np.expm1(preds_array)
+    return pd.Series(preds_array, index=future_dates, name="forecast")
 
 
 def train_xgb_direct_multistep(
@@ -412,6 +448,7 @@ def train_xgb_direct_multistep(
     horizons: int = 30,
     lags: list | None = None,
     holiday_country: str | None = None,
+    log_target: bool = True,
     **kwargs,
 ) -> list[tuple[XGBRegressor, list]]:
     """
@@ -420,12 +457,15 @@ def train_xgb_direct_multistep(
     day, using only actual historical values as features.
     Avoids the error accumulation of iterative one-step-ahead forecasting.
 
+    When log_target=True (default), both features and targets are log1p-transformed.
+
     Returns a list of (model, feat_cols) tuples, one per horizon.
     """
+    train_series = pd.Series(np.log1p(series.values), index=series.index) if log_target else series
     models = []
     for h in range(1, horizons + 1):
-        shifted_target = series.shift(-h)
-        df = make_lag_features(series, lags=lags, holiday_country=holiday_country)
+        shifted_target = train_series.shift(-h)
+        df = make_lag_features(train_series, lags=lags, holiday_country=holiday_country)
         valid_idx = df.index[df.index.isin(shifted_target.dropna().index)]
         df_h = df.loc[valid_idx].copy()
         y_h = shifted_target.loc[valid_idx].values
@@ -436,11 +476,13 @@ def train_xgb_direct_multistep(
             learning_rate=kwargs.get("learning_rate", 0.05),
             subsample=kwargs.get("subsample", 0.9),
             colsample_bytree=kwargs.get("colsample_bytree", 0.9),
-            objective="reg:squarederror",
+            objective="reg:quantileerror",
+            quantile_alpha=0.5,
             random_state=42,
             verbosity=0,
         )
         model.fit(df_h[feat_cols].values, y_h)
+        model.log_target = log_target
         models.append((model, feat_cols))
     return models
 
@@ -453,11 +495,13 @@ def forecast_xgb_direct(
     """
     Direct multi-step forecast using per-horizon models.
     Each model sees only actual historical values as features — no error accumulation.
-    The `extended` list is never modified, so all 30 predictions use the same
-    historical context.
+    If models have log_target=True, history is log1p-transformed for feature building
+    and predictions are expm1-inverted back to original scale.
     """
+    first_model = models[0][0] if models else None
+    log_target = getattr(first_model, "log_target", False)
     history = pd.Series(history).sort_index()
-    extended = list(history.values.astype(float))
+    extended = list(np.log1p(history.values.astype(float)) if log_target else history.values.astype(float))
     future_dates = pd.date_range(
         history.index[-1] + pd.Timedelta(days=1),
         periods=len(models),
@@ -475,7 +519,10 @@ def forecast_xgb_direct(
         predictions.append(pred)
         # Key: do NOT append pred to extended.
         # Every model uses actual historical values only.
-    return pd.Series(predictions, index=future_dates, name="forecast")
+    preds_array = np.array(predictions)
+    if log_target:
+        preds_array = np.expm1(preds_array)
+    return pd.Series(preds_array, index=future_dates, name="forecast")
 
 
 def train_sarima_forecaster(
@@ -601,16 +648,20 @@ def train_xgb_forecaster_with_intervals(
     quantiles: tuple = FORECAST_QUANTILES,
     extra_features: pd.DataFrame | None = None,
     holiday_country: str | None = None,
+    log_target: bool = True,
     **kwargs,
 ) -> dict:
     """
     Train XGBoost models at specified quantiles (p10, p50, p90).
+    When log_target=True (default), series is log1p-transformed; forecast_xgb_with_intervals
+    delegates to forecast_xgb which handles the inversion automatically.
 
     Returns:
         dict like {"q10": (model, feat_cols), "q50": (model, feat_cols), "q90": (model, feat_cols)}
     """
+    train_series = pd.Series(np.log1p(series.values), index=series.index) if log_target else series
     df = make_lag_features(
-        series,
+        train_series,
         lags=lags,
         extra_features=extra_features,
         holiday_country=holiday_country,
@@ -634,6 +685,7 @@ def train_xgb_forecaster_with_intervals(
             verbosity=0,
         )
         model.fit(X_vals, y_vals)
+        model.log_target = log_target
         result[label_map.get(q, f"q{int(q * 100)}")] = (model, feat_cols)
     return result
 
@@ -674,3 +726,129 @@ def forecast_xgb_with_intervals(
             "yhat_upper": q90.values,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Stacking ensemble (Ridge meta-learner over XGB + Prophet + SARIMA)
+# ---------------------------------------------------------------------------
+
+def generate_oof_predictions(
+    series: pd.Series,
+    n_splits: int = 5,
+    lags: list | None = None,
+    holiday_country: str | None = None,
+) -> pd.DataFrame:
+    """
+    Expanding-window cross-validation that returns out-of-fold predictions
+    from XGBoost, Prophet, and SARIMA, aligned to the series index.
+
+    Returns a DataFrame with columns: xgb, prophet, sarima, actual.
+    Only rows covered by at least one validation fold are included.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+
+    n = len(series)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    oof_xgb = np.full(n, np.nan)
+    oof_prophet = np.full(n, np.nan)
+    oof_sarima = np.full(n, np.nan)
+
+    for train_idx, val_idx in tscv.split(np.arange(n)):
+        train = series.iloc[train_idx]
+        val_len = len(val_idx)
+
+        try:
+            m, cols = train_xgb_forecaster(train, lags=lags, holiday_country=holiday_country)
+            xgb_preds = forecast_xgb(m, cols, train, periods=val_len).values
+            oof_xgb[val_idx] = xgb_preds
+        except Exception:
+            oof_xgb[val_idx] = series.iloc[val_idx].values
+
+        try:
+            pm = train_prophet_forecaster(train, holiday_country=holiday_country)
+            prophet_df = forecast_prophet(pm, periods=val_len)
+            oof_prophet[val_idx] = prophet_df["yhat"].values
+        except Exception:
+            oof_prophet[val_idx] = series.iloc[val_idx].values
+
+        try:
+            sarima_res = train_sarima_forecaster(train)
+            oof_sarima[val_idx] = forecast_sarima(sarima_res, periods=val_len).values
+        except Exception:
+            oof_sarima[val_idx] = series.iloc[val_idx].values
+
+    mask = ~np.isnan(oof_xgb)
+    return pd.DataFrame(
+        {
+            "xgb": oof_xgb[mask],
+            "prophet": oof_prophet[mask],
+            "sarima": oof_sarima[mask],
+            "actual": series.values[mask],
+        },
+        index=series.index[mask],
+    )
+
+
+def train_stacking_ensemble(
+    series: pd.Series,
+    n_splits: int = 5,
+    lags: list | None = None,
+    holiday_country: str | None = None,
+):
+    """
+    Train a Ridge meta-learner on OOF predictions from XGB, Prophet, and SARIMA.
+
+    Returns:
+        meta_model       : fitted Ridge regressor
+        component_models : dict with keys xgb, prophet, sarima — full-series models
+    """
+    from sklearn.linear_model import Ridge
+
+    oof = generate_oof_predictions(series, n_splits=n_splits, lags=lags, holiday_country=holiday_country)
+    X_meta = oof[["xgb", "prophet", "sarima"]].values
+    y_meta = oof["actual"].values
+
+    meta_model = Ridge(alpha=1.0)
+    meta_model.fit(X_meta, y_meta)
+
+    xgb_m, xgb_cols = train_xgb_forecaster(series, lags=lags, holiday_country=holiday_country)
+    prophet_m = train_prophet_forecaster(series, holiday_country=holiday_country)
+    sarima_m = train_sarima_forecaster(series)
+
+    component_models = {
+        "xgb": (xgb_m, xgb_cols),
+        "prophet": prophet_m,
+        "sarima": sarima_m,
+    }
+    return meta_model, component_models
+
+
+def forecast_stacked(
+    meta_model,
+    component_models: dict,
+    history: pd.Series,
+    periods: int = 30,
+    holiday_country: str | None = None,
+) -> pd.Series:
+    """
+    Generate a stacked forecast: get individual predictions from XGB, Prophet,
+    and SARIMA, then apply the Ridge meta-learner to combine them.
+    """
+    xgb_m, xgb_cols = component_models["xgb"]
+    prophet_m = component_models["prophet"]
+    sarima_m = component_models["sarima"]
+
+    xgb_preds = forecast_xgb(xgb_m, xgb_cols, history, periods=periods, holiday_country=holiday_country).values
+    prophet_df = forecast_prophet(prophet_m, periods=periods)
+    prophet_preds = prophet_df["yhat"].values
+    sarima_preds = forecast_sarima(sarima_m, periods=periods).values
+
+    X_meta = np.column_stack([xgb_preds, prophet_preds, sarima_preds])
+    stacked = meta_model.predict(X_meta)
+
+    future_dates = pd.date_range(
+        history.index[-1] + pd.Timedelta(days=1),
+        periods=periods,
+        freq="D",
+    )
+    return pd.Series(stacked, index=future_dates, name="forecast_stacked")

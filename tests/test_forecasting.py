@@ -14,6 +14,8 @@ from src.forecasting import (
     forecast_xgb_with_intervals,
     train_sarima_forecaster,
     forecast_sarima,
+    train_stacking_ensemble,
+    forecast_stacked,
     _school_holiday_features,
 )
 
@@ -215,3 +217,83 @@ def test_blend_forecasts_weight_1_equals_xgb(daily_series):
     other = xgb_fc * 2.0
     result = blend_forecasts(xgb_fc, other, xgb_weight=1.0)
     np.testing.assert_array_almost_equal(result.values, xgb_fc.values)
+
+
+# ---------------------------------------------------------------------------
+# Track 4: log1p target transform
+# ---------------------------------------------------------------------------
+
+def test_log_target_forecast_positive(daily_series):
+    """log_target=True model returns strictly positive forecasts."""
+    model, feat_cols = train_xgb_forecaster(daily_series, lags=[1, 7], log_target=True)
+    assert getattr(model, "log_target", False) is True
+    preds = forecast_xgb(model, feat_cols, daily_series, periods=10)
+    assert (preds.values > 0).all()
+
+
+def test_log_target_off_returns_raw(daily_series):
+    """log_target=False model does not set log_target attribute."""
+    model, _ = train_xgb_forecaster(daily_series, lags=[1, 7], log_target=False)
+    assert getattr(model, "log_target", False) is False
+
+
+def test_log_target_direct_positive(daily_series):
+    """Direct multi-step with log_target=True returns positive values."""
+    models = train_xgb_direct_multistep(daily_series, horizons=5, lags=[1, 7], log_target=True)
+    preds = forecast_xgb_direct(models, daily_series)
+    assert (preds.values > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Track 5a: interaction features
+# ---------------------------------------------------------------------------
+
+def test_interaction_features_present(daily_series):
+    """make_lag_features includes all 6 interaction columns."""
+    df = make_lag_features(daily_series, lags=[1, 7])
+    for col in ["season", "dow_sin_x_month", "dow_cos_x_month",
+                "is_weekend_x_holiday", "school_x_weekend", "season_x_is_weekend"]:
+        assert col in df.columns, f"Missing interaction column: {col}"
+
+
+def test_season_values_in_range(daily_series):
+    """season column is in {0, 1, 2, 3}."""
+    df = make_lag_features(daily_series, lags=[1, 7])
+    assert set(df["season"].unique()).issubset({0, 1, 2, 3})
+
+
+# ---------------------------------------------------------------------------
+# Track 5d: stacking ensemble
+# ---------------------------------------------------------------------------
+
+def test_stacking_ensemble_trains(daily_series):
+    """train_stacking_ensemble completes without error on a 200-day series."""
+    meta, components = train_stacking_ensemble(daily_series, n_splits=3, lags=[1, 7])
+    assert meta is not None
+    assert set(components.keys()) == {"xgb", "prophet", "sarima"}
+
+
+def test_stacking_forecast_length(daily_series):
+    """forecast_stacked returns a Series of the requested length."""
+    meta, components = train_stacking_ensemble(daily_series, n_splits=3, lags=[1, 7])
+    preds = forecast_stacked(meta, components, daily_series, periods=14)
+    assert len(preds) == 14
+    assert preds.index[0] > daily_series.index[-1]
+
+
+# ---------------------------------------------------------------------------
+# Booking velocity features
+# ---------------------------------------------------------------------------
+
+def test_velocity_features_present(daily_series):
+    """make_lag_features includes booking velocity and acceleration sign columns."""
+    df = make_lag_features(daily_series, lags=[1, 7])
+    assert "booking_velocity_7" in df.columns
+    assert "booking_velocity_14" in df.columns
+    assert "booking_accel_sign" in df.columns
+
+
+def test_accel_sign_values(daily_series):
+    """booking_accel_sign is in {-1, 0, 1}."""
+    df = make_lag_features(daily_series, lags=[1, 7])
+    assert set(df["booking_accel_sign"].unique()).issubset({-1, 0, 1})

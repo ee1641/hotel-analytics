@@ -164,7 +164,7 @@ def _save_versioned(name: str, obj, version: str, models_dir: Path) -> None:
     model_cache.save_artifact(name, obj, metadata={"version": version}, models_dir=models_dir)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Training models… this may take a few minutes on first run.")
 def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id: str):
     """
     Granular per-artifact check: load from disk if present, otherwise train and save.
@@ -172,6 +172,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
     models_path = Path(models_dir)
     df, daily_df = _load_and_prepare_data_from_path(data_path, dataset_id)
     results = {}
+    print("[1/7] Cancellation models…", flush=True)
 
     # ------------------------------------------------------------------
     # Cancellation classification
@@ -248,6 +249,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["label_encoders"] = label_encoders
         results["feature_defaults"] = feature_defaults
         results["selected_features"] = selected_features
+        print("[1/7] Cancellation models done.", flush=True)
         _save_versioned("cancel_models", cancel_models, CANCELLATION_MODEL_VERSION, models_path)
         model_cache.save_artifact("feature_columns", feature_columns, models_dir=models_path)
         model_cache.save_artifact("label_encoders", label_encoders, models_dir=models_path)
@@ -344,31 +346,43 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         ),
     ]
 
+    # Cache of tuned hyperparams keyed by series column name — tune once, reuse for
+    # both the main model and the quantile-interval model of the same series.
+    _series_best_params: dict = {}
+
+    print("[2/7] Revenue & demand forecast models (3 series)…", flush=True)
     revenue_series_lookup = {}
     for xgb_key, interval_key, prophet_key, column, label in revenue_model_specs:
         series = _validated_forecast_series(revenue_daily_df, column, dataset_id, label)
         revenue_series_lookup[column] = series
         _extra = _combined_extra(series.index)
 
-        if _artifact_current(xgb_key, FORECAST_MODEL_VERSION, models_dir=models_path):
-            results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
-        else:
-            best_p = tune_xgb_forecaster(series, lags=FORECAST_LAGS,
-                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-            xgb_m, xgb_cols = train_xgb_forecaster(series, lags=FORECAST_LAGS,
-                                                    extra_features=_extra, **best_p)
-            results[xgb_key] = (xgb_m, xgb_cols)
-            _save_versioned(xgb_key, (xgb_m, xgb_cols), FORECAST_MODEL_VERSION, models_path)
+        xgb_cached      = _artifact_current(xgb_key,      FORECAST_MODEL_VERSION,  models_dir=models_path)
+        interval_cached = _artifact_current(interval_key,  INTERVAL_MODEL_VERSION,  models_dir=models_path)
 
-        if _artifact_current(interval_key, INTERVAL_MODEL_VERSION, models_dir=models_path):
+        if xgb_cached:
+            results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
+        if interval_cached:
             results[interval_key] = model_cache.load_artifact(interval_key, models_dir=models_path)
-        else:
+
+        if not xgb_cached or not interval_cached:
+            # Tune once; reuse params for both main model and intervals model.
             best_p = tune_xgb_forecaster(series, lags=FORECAST_LAGS,
                                          n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-            interval_models = train_xgb_forecaster_with_intervals(series, lags=FORECAST_LAGS,
-                                                                   extra_features=_extra, **best_p)
-            results[interval_key] = interval_models
-            _save_versioned(interval_key, interval_models, INTERVAL_MODEL_VERSION, models_path)
+            _series_best_params[column] = best_p
+            if not xgb_cached:
+                xgb_m, xgb_cols = train_xgb_forecaster(series, lags=FORECAST_LAGS,
+                                                        extra_features=_extra, **best_p)
+                results[xgb_key] = (xgb_m, xgb_cols)
+                _save_versioned(xgb_key, (xgb_m, xgb_cols), FORECAST_MODEL_VERSION, models_path)
+            if not interval_cached:
+                interval_models = train_xgb_forecaster_with_intervals(series, lags=FORECAST_LAGS,
+                                                                       extra_features=_extra, **best_p)
+                results[interval_key] = interval_models
+                _save_versioned(interval_key, interval_models, INTERVAL_MODEL_VERSION, models_path)
+        else:
+            # Both cached — no tuning needed; store a sentinel so eval can fall back gracefully.
+            _series_best_params.setdefault(column, None)
 
         if _artifact_current(prophet_key, PROPHET_MODEL_VERSION, models_dir=models_path):
             results[prophet_key] = model_cache.load_artifact(prophet_key, models_dir=models_path)
@@ -377,28 +391,34 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             results[prophet_key] = prophet_model
             _save_versioned(prophet_key, prophet_model, PROPHET_MODEL_VERSION, models_path)
 
+    print("[3/7] Demand forecast model…", flush=True)
     dem_series = _validated_forecast_series(revenue_daily_df, "daily_bookings", dataset_id, "booking")
     _extra_dem = _combined_extra(dem_series.index)
 
-    if _artifact_current("xgb_demand", FORECAST_MODEL_VERSION, models_dir=models_path):
-        results["xgb_demand"] = model_cache.load_artifact("xgb_demand", models_dir=models_path)
-    else:
-        best_p = tune_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
-                                     n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-        xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
-                                                   extra_features=_extra_dem, **best_p)
-        results["xgb_demand"] = (xgb_d, xgb_d_cols)
-        _save_versioned("xgb_demand", (xgb_d, xgb_d_cols), FORECAST_MODEL_VERSION, models_path)
+    dem_xgb_cached      = _artifact_current("xgb_demand",           FORECAST_MODEL_VERSION,  models_dir=models_path)
+    dem_interval_cached = _artifact_current("xgb_demand_intervals",  INTERVAL_MODEL_VERSION,  models_dir=models_path)
 
-    if _artifact_current("xgb_demand_intervals", INTERVAL_MODEL_VERSION, models_dir=models_path):
+    if dem_xgb_cached:
+        results["xgb_demand"] = model_cache.load_artifact("xgb_demand", models_dir=models_path)
+    if dem_interval_cached:
         results["xgb_demand_intervals"] = model_cache.load_artifact("xgb_demand_intervals", models_dir=models_path)
+
+    if not dem_xgb_cached or not dem_interval_cached:
+        best_p_dem = tune_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
+                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+        _series_best_params["daily_bookings"] = best_p_dem
+        if not dem_xgb_cached:
+            xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
+                                                       extra_features=_extra_dem, **best_p_dem)
+            results["xgb_demand"] = (xgb_d, xgb_d_cols)
+            _save_versioned("xgb_demand", (xgb_d, xgb_d_cols), FORECAST_MODEL_VERSION, models_path)
+        if not dem_interval_cached:
+            interval_models = train_xgb_forecaster_with_intervals(dem_series, lags=FORECAST_LAGS,
+                                                                   extra_features=_extra_dem, **best_p_dem)
+            results["xgb_demand_intervals"] = interval_models
+            _save_versioned("xgb_demand_intervals", interval_models, INTERVAL_MODEL_VERSION, models_path)
     else:
-        best_p = tune_xgb_forecaster(dem_series, lags=FORECAST_LAGS,
-                                     n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-        interval_models = train_xgb_forecaster_with_intervals(dem_series, lags=FORECAST_LAGS,
-                                                               extra_features=_extra_dem, **best_p)
-        results["xgb_demand_intervals"] = interval_models
-        _save_versioned("xgb_demand_intervals", interval_models, INTERVAL_MODEL_VERSION, models_path)
+        _series_best_params.setdefault("daily_bookings", None)
 
     if _artifact_current("prophet_demand", PROPHET_MODEL_VERSION, models_dir=models_path):
         results["prophet_demand"] = model_cache.load_artifact("prophet_demand", models_dir=models_path)
@@ -407,9 +427,11 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["prophet_demand"] = prophet_dem
         _save_versioned("prophet_demand", prophet_dem, PROPHET_MODEL_VERSION, models_path)
 
+    print("[4/7] Ensemble weights…", flush=True)
     # ------------------------------------------------------------------
     # Ensemble weights: find optimal XGBoost weight in XGBoost+Prophet blend
     # Optimised on a 60-day validation window before the holdout test set.
+    # Reuses tuned hyperparams from the full series — no extra tuning pass.
     # ------------------------------------------------------------------
     if _artifact_current("ensemble_weights", ENSEMBLE_WEIGHTS_VERSION, models_dir=models_path):
         results["ensemble_weights"] = model_cache.load_artifact("ensemble_weights", models_dir=models_path)
@@ -420,8 +442,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             dem_val = dem_series.iloc[-(test_days_ew + val_days):-test_days_ew]
             dem_val_train = dem_series.iloc[:-(test_days_ew + val_days)]
             _val_extra = _combined_extra(dem_val_train.index)
-            _vp_dem = tune_xgb_forecaster(dem_val_train, lags=FORECAST_LAGS,
-                                          n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            _vp_dem = _series_best_params.get("daily_bookings") or {}
             xgb_val_m, xgb_val_c = train_xgb_forecaster(dem_val_train, lags=FORECAST_LAGS,
                                                           extra_features=_val_extra, **_vp_dem)
             prophet_val_m = train_prophet_forecaster(dem_val_train)
@@ -435,8 +456,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             rev_val = rev_series.iloc[-(test_days_ew + val_days):-test_days_ew]
             rev_val_train = rev_series.iloc[:-(test_days_ew + val_days)]
             _val_extra_rev = _combined_extra(rev_val_train.index)
-            _vp_rev = tune_xgb_forecaster(rev_val_train, lags=FORECAST_LAGS,
-                                          n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            _vp_rev = _series_best_params.get("daily_booked_revenue") or {}
             xgb_rev_val_m, xgb_rev_val_c = train_xgb_forecaster(rev_val_train, lags=FORECAST_LAGS,
                                                                    extra_features=_val_extra_rev, **_vp_rev)
             prophet_rev_val_m = train_prophet_forecaster(rev_val_train)
@@ -453,6 +473,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             logging.warning("Ensemble weight computation failed: %s", exc)
             results["ensemble_weights"] = {"demand": 1.0, "revenue": 1.0}
 
+    print("[5/7] Survival model…", flush=True)
     if _artifact_current("cancel_survival_model", SURVIVAL_MODEL_VERSION, models_dir=models_path):
         results["cancel_survival_model"] = model_cache.load_artifact("cancel_survival_model", models_dir=models_path)
     else:
@@ -460,11 +481,16 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["cancel_survival_model"] = survival_bundle
         _save_versioned("cancel_survival_model", survival_bundle, SURVIVAL_MODEL_VERSION, models_path)
 
+    print("[6/7] Per-hotel segmented models…", flush=True)
     # ------------------------------------------------------------------
     # Per-hotel-type segmented models (Track 1 + Track 2)
     # ------------------------------------------------------------------
     hotel_daily_map = aggregate_daily_by_hotel_type(df)
     results["hotel_types_available"] = list(hotel_daily_map.keys())
+
+    # Tuned hyperparams keyed by (slug, column) — tune once per series, reuse
+    # for both the main segmented model and its quantile-interval companion.
+    _hotel_best_params: dict = {}
 
     for hotel_type, hotel_daily_df in hotel_daily_map.items():
         slug = _hotel_slug(hotel_type)
@@ -504,25 +530,30 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                 continue
             _h_extra = _hotel_extra(h_series.index)
 
-            if _artifact_current(xgb_key, SEGMENTED_MODEL_VERSION, models_dir=models_path):
-                results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
-            else:
-                best_p = tune_xgb_forecaster(h_series, lags=FORECAST_LAGS,
-                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-                xgb_m, xgb_cols = train_xgb_forecaster(h_series, lags=FORECAST_LAGS,
-                                                        extra_features=_h_extra, **best_p)
-                results[xgb_key] = (xgb_m, xgb_cols)
-                _save_versioned(xgb_key, (xgb_m, xgb_cols), SEGMENTED_MODEL_VERSION, models_path)
+            h_xgb_cached      = _artifact_current(xgb_key,      SEGMENTED_MODEL_VERSION,   models_dir=models_path)
+            h_interval_cached = _artifact_current(interval_key,  SEGMENTED_INTERVAL_VERSION, models_dir=models_path)
 
-            if _artifact_current(interval_key, SEGMENTED_INTERVAL_VERSION, models_dir=models_path):
+            if h_xgb_cached:
+                results[xgb_key] = model_cache.load_artifact(xgb_key, models_dir=models_path)
+            if h_interval_cached:
                 results[interval_key] = model_cache.load_artifact(interval_key, models_dir=models_path)
-            else:
+
+            if not h_xgb_cached or not h_interval_cached:
                 best_p = tune_xgb_forecaster(h_series, lags=FORECAST_LAGS,
                                              n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-                imodels = train_xgb_forecaster_with_intervals(h_series, lags=FORECAST_LAGS,
-                                                              extra_features=_h_extra, **best_p)
-                results[interval_key] = imodels
-                _save_versioned(interval_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
+                _hotel_best_params[(slug, column)] = best_p
+                if not h_xgb_cached:
+                    xgb_m, xgb_cols = train_xgb_forecaster(h_series, lags=FORECAST_LAGS,
+                                                            extra_features=_h_extra, **best_p)
+                    results[xgb_key] = (xgb_m, xgb_cols)
+                    _save_versioned(xgb_key, (xgb_m, xgb_cols), SEGMENTED_MODEL_VERSION, models_path)
+                if not h_interval_cached:
+                    imodels = train_xgb_forecaster_with_intervals(h_series, lags=FORECAST_LAGS,
+                                                                  extra_features=_h_extra, **best_p)
+                    results[interval_key] = imodels
+                    _save_versioned(interval_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
+            else:
+                _hotel_best_params.setdefault((slug, column), None)
 
         dem_key = f"xgb_demand_{slug}"
         dem_int_key = f"xgb_demand_intervals_{slug}"
@@ -533,26 +564,32 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             continue
         _h_extra_dem = _hotel_extra(h_dem.index)
 
-        if _artifact_current(dem_key, SEGMENTED_MODEL_VERSION, models_dir=models_path):
+        h_dem_cached     = _artifact_current(dem_key,     SEGMENTED_MODEL_VERSION,    models_dir=models_path)
+        h_dem_int_cached = _artifact_current(dem_int_key, SEGMENTED_INTERVAL_VERSION, models_dir=models_path)
+
+        if h_dem_cached:
             results[dem_key] = model_cache.load_artifact(dem_key, models_dir=models_path)
-        else:
-            best_p = tune_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
-                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-            xgb_d, xgb_d_cols = train_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
-                                                       extra_features=_h_extra_dem, **best_p)
-            results[dem_key] = (xgb_d, xgb_d_cols)
-            _save_versioned(dem_key, (xgb_d, xgb_d_cols), SEGMENTED_MODEL_VERSION, models_path)
-
-        if _artifact_current(dem_int_key, SEGMENTED_INTERVAL_VERSION, models_dir=models_path):
+        if h_dem_int_cached:
             results[dem_int_key] = model_cache.load_artifact(dem_int_key, models_dir=models_path)
-        else:
-            best_p = tune_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
-                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
-            imodels = train_xgb_forecaster_with_intervals(h_dem, lags=FORECAST_LAGS,
-                                                          extra_features=_h_extra_dem, **best_p)
-            results[dem_int_key] = imodels
-            _save_versioned(dem_int_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
 
+        if not h_dem_cached or not h_dem_int_cached:
+            best_p_hd = tune_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
+                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            _hotel_best_params[(slug, "daily_bookings")] = best_p_hd
+            if not h_dem_cached:
+                xgb_d, xgb_d_cols = train_xgb_forecaster(h_dem, lags=FORECAST_LAGS,
+                                                           extra_features=_h_extra_dem, **best_p_hd)
+                results[dem_key] = (xgb_d, xgb_d_cols)
+                _save_versioned(dem_key, (xgb_d, xgb_d_cols), SEGMENTED_MODEL_VERSION, models_path)
+            if not h_dem_int_cached:
+                imodels = train_xgb_forecaster_with_intervals(h_dem, lags=FORECAST_LAGS,
+                                                               extra_features=_h_extra_dem, **best_p_hd)
+                results[dem_int_key] = imodels
+                _save_versioned(dem_int_key, imodels, SEGMENTED_INTERVAL_VERSION, models_path)
+        else:
+            _hotel_best_params.setdefault((slug, "daily_bookings"), None)
+
+    print("[7/7] Evaluation metrics…", flush=True)
     required_eval_keys = {
         "demand_xgb",
         "demand_xgb_baseline",
@@ -592,9 +629,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         dem_base_preds = forecast_xgb(xgb_base_m, xgb_base_c, dem_train, len(dem_test))
         dem_base_preds.index = dem_test.index
 
-        # Tuned hyperparameters + OTB features (matches production model)
-        dem_best_p = tune_xgb_forecaster(dem_train, lags=FORECAST_LAGS,
-                                         n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+        dem_best_p = _series_best_params.get("daily_bookings") or {}
         xgb_dem_m, xgb_dem_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS,
                                                       extra_features=_otb_eval, **dem_best_p)
         dem_xgb_preds = forecast_xgb(xgb_dem_m, xgb_dem_c, dem_train, len(dem_test))
@@ -630,9 +665,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             rev_base_preds = forecast_xgb(xgb_rev_base, xgb_rev_base_c, rev_train, len(rev_test))
             rev_base_preds.index = rev_test.index
 
-            # Tuned + OTB (matches production model)
-            rev_best_p = tune_xgb_forecaster(rev_train, lags=FORECAST_LAGS,
-                                             n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+            rev_best_p = _series_best_params.get(column) or {}
             xgb_rev_m, xgb_rev_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS,
                                                           extra_features=_otb_rev_eval, **rev_best_p)
             rev_xgb_preds = forecast_xgb(xgb_rev_m, xgb_rev_c, rev_train, len(rev_test))
@@ -671,8 +704,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                     continue
                 h_train = h_s.iloc[:-test_days]
                 h_test = h_s.iloc[-test_days:]
-                h_best_p = tune_xgb_forecaster(h_train, lags=FORECAST_LAGS,
-                                               n_iter=FORECAST_TUNE_N_ITER, n_splits=FORECAST_TUNE_N_SPLITS)
+                h_best_p = _hotel_best_params.get((slug, column)) or {}
                 h_m, h_c = train_xgb_forecaster(h_train, lags=FORECAST_LAGS,
                                                 extra_features=_combined_extra(h_train.index), **h_best_p)
                 h_preds = forecast_xgb(h_m, h_c, h_train, len(h_test))
@@ -702,6 +734,7 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         results["eval_metrics"] = eval_metrics
         _save_versioned("eval_metrics", eval_metrics, EVAL_METRICS_VERSION, models_path)
 
+    print("All models ready.", flush=True)
     return results
 
 

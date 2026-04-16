@@ -22,12 +22,13 @@ st.markdown(
     "Profit calculations use **expected realized revenue** so cancellation risk is reflected in the baseline."
 )
 
-try:
-    _, daily_df = load_and_prepare_data()
-    models = get_or_train_models()
-except Exception as e:
-    st.error(f"Failed to load data or models: {e}")
-    st.stop()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    try:
+        _, daily_df = load_and_prepare_data()
+        models = get_or_train_models()
+    except Exception as e:
+        st.error(f"Failed to load data or models: {e}")
+        st.stop()
 
 daily_df = models.get("daily_revenue_views", daily_df)
 
@@ -88,7 +89,7 @@ with chart_col1:
         title=f"30-Day Expected Revenue Breakdown (Tax {tax_rate:.0%}, Cost {cost_ratio:.0%})",
     )
     fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-    st.plotly_chart(fig_pie, use_container_width=True)
+    st.plotly_chart(fig_pie, width='stretch')
 
 with chart_col2:
     st.subheader("30-Day Revenue Outlook")
@@ -110,7 +111,7 @@ with chart_col2:
         },
     )
     fig_lines.update_layout(height=380)
-    st.plotly_chart(fig_lines, use_container_width=True)
+    st.plotly_chart(fig_lines, width='stretch')
 
 st.subheader("30-Day Summary")
 summary_df = pd.DataFrame({
@@ -135,7 +136,7 @@ summary_df = pd.DataFrame({
 
 st.dataframe(
     summary_df.style.format({"Amount (€)": "€{:,.2f}", "% of Expected Revenue": "{:.1f}%"}),
-    use_container_width=True,
+    width='stretch',
 )
 
 if profit > 0:

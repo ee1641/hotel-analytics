@@ -7,20 +7,23 @@ FORECAST_QUANTILES = (0.1, 0.5, 0.9)
 MIN_FORECAST_HISTORY = 31
 
 # Hyperparameter tuning config for forecasting
-FORECAST_TUNE_N_ITER = 20   # random param candidates to evaluate per series
+FORECAST_TUNE_N_ITER = 10   # random param candidates to evaluate per series
 FORECAST_TUNE_N_SPLITS = 3  # expanding-window time-series CV folds
 
-FORECAST_MODEL_VERSION        = "forecast_v10_weather"
+FORECAST_MODEL_VERSION        = "forecast_v15_pace"
 PROPHET_MODEL_VERSION         = "prophet_v3_school_holidays"
-INTERVAL_MODEL_VERSION        = "forecast_intervals_v9_weather"
-CANCELLATION_MODEL_VERSION    = "cancellation_v5_featureset"
+INTERVAL_MODEL_VERSION        = "forecast_intervals_v11_velocity"
+CANCELLATION_MODEL_VERSION    = "cancellation_v7_stacked"
 SURVIVAL_MODEL_VERSION        = "cancellation_survival_v1"
-EVAL_METRICS_VERSION          = "evaluation_v9_weather"
-DIRECT_FORECAST_MODEL_VERSION = "forecast_direct_v2_tuned"
+EVAL_METRICS_VERSION          = "evaluation_v13_pace"
+DIRECT_FORECAST_MODEL_VERSION = "forecast_direct_v5_velocity"
 
-# Per-segment model versions (Track 1 + Track 2 + Track 3: weather features)
-SEGMENTED_MODEL_VERSION    = "forecast_v10_weather"
-SEGMENTED_INTERVAL_VERSION = "forecast_intervals_v9_weather"
+# Per-segment model versions (Track 4+5+6: velocity, log-target, quantile loss)
+SEGMENTED_MODEL_VERSION    = "forecast_v13_velocity"
+SEGMENTED_INTERVAL_VERSION = "forecast_intervals_v11_velocity"
 
 # Ensemble weights
 ENSEMBLE_WEIGHTS_VERSION   = "ensemble_v1_xgb_prophet"
+
+# Stacking ensemble
+STACKING_META_VERSION      = "stacking_v1_ridge"

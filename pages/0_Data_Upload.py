@@ -41,7 +41,7 @@ if uploaded is not None:
         raw_df = pd.read_csv(uploaded)
         st.write(f"Loaded **{len(raw_df):,} rows** x **{len(raw_df.columns)} columns**")
         with st.expander("Preview raw data"):
-            st.dataframe(raw_df.head(5), use_container_width=True)
+            st.dataframe(raw_df.head(5), width='stretch')
 
         suggested = auto_detect_columns(raw_df)
         canonical_options = ["(skip)"] + list(CANONICAL_SCHEMA["columns"].keys())

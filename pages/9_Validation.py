@@ -62,7 +62,7 @@ if _eval_metrics:
             "Resort Hotel": _fmt(_resort_key),
             "City Hotel": _fmt(_city_key),
         })
-    st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(_rows), width='stretch', hide_index=True)
     st.divider()
 
 st.caption(
@@ -277,7 +277,7 @@ if "error" not in xgb_res and xgb_res:
             )
         )
         cm_fig.update_layout(height=340, margin=dict(t=20, b=20, l=20, r=20))
-        st.plotly_chart(cm_fig, use_container_width=True)
+        st.plotly_chart(cm_fig, width='stretch')
 
     # --- Probability distribution ---
     with chart_col2:
@@ -315,7 +315,7 @@ if "error" not in xgb_res and xgb_res:
             height=340,
             margin=dict(t=40, b=20, l=20, r=20),
         )
-        st.plotly_chart(dist_fig, use_container_width=True)
+        st.plotly_chart(dist_fig, width='stretch')
 
 # ---------------------------------------------------------------------------
 # Section 8 — Row-level table
@@ -368,7 +368,7 @@ if xgb_res and "error" not in xgb_res:
             lambda v: "color: tomato;" if v == "Canceled" else "",
             subset=["Predicted", "Actual"],
         ).format({"Predicted Prob": "{:.1f}%"}),
-        use_container_width=True,
+        width='stretch',
         height=500,
     )
 

@@ -70,6 +70,46 @@ def ts_cross_val_scores(
     return pd.DataFrame(rows)
 
 
+def forecast_error_breakdown(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> dict:
+    """
+    Per-weekday and per-month MAPE breakdown.
+
+    Returns a dict with:
+      by_weekday : DataFrame indexed by day name (Mon-Sun) with column 'mape'
+      by_month   : DataFrame indexed by month number (1-12) with column 'mape'
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    index = pd.DatetimeIndex(index)
+
+    mask = y_true != 0
+    ape = np.where(mask, np.abs((y_true - y_pred) / y_true) * 100, np.nan)
+
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    by_weekday = (
+        pd.DataFrame({"ape": ape, "dow": index.dayofweek})
+        .groupby("dow")["ape"]
+        .mean()
+        .rename(index=dict(enumerate(day_names)))
+        .rename("mape")
+        .to_frame()
+    )
+
+    by_month = (
+        pd.DataFrame({"ape": ape, "month": index.month})
+        .groupby("month")["ape"]
+        .mean()
+        .rename("mape")
+        .to_frame()
+    )
+
+    return {"by_weekday": by_weekday, "by_month": by_month}
+
+
 def classification_report_dict(
     y_true: np.ndarray,
     y_pred: np.ndarray,

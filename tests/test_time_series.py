@@ -37,6 +37,22 @@ def test_aggregate_has_required_columns(df):
     assert "daily_expected_realized_revenue" in daily.columns
     assert "daily_bookings" in daily.columns
     assert "daily_cancellations" in daily.columns
+    assert "implied_adr" in daily.columns
+    assert "net_daily_bookings" in daily.columns
+    assert "daily_cancellation_rate" in daily.columns
+
+
+def test_net_daily_bookings_non_negative(df):
+    dated = build_arrival_date(df)
+    daily = aggregate_daily(dated)
+    assert (daily["net_daily_bookings"] >= 0).all()
+
+
+def test_daily_cancellation_rate_bounded(df):
+    dated = build_arrival_date(df)
+    daily = aggregate_daily(dated)
+    assert (daily["daily_cancellation_rate"] >= 0).all()
+    assert (daily["daily_cancellation_rate"] <= 1).all()
 
 
 def test_aggregate_index_is_datetime(df):

@@ -9,7 +9,6 @@ Output PNGs are saved to ./outputs/
 import warnings
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
@@ -19,9 +18,22 @@ from src.forecasting import (
     train_xgb_forecaster, forecast_xgb,
     train_prophet_forecaster, forecast_prophet,
 )
-from src.cancellation import train_cancellation_models, predict_cancellation_proba
+from src.cancellation import (
+    TARGET_ENCODED_COLS,
+    compute_scale_pos_weight,
+    find_optimal_threshold,
+    predict_cancellation_proba,
+    predict_stacked_proba,
+    train_cancellation_models_balanced,
+    train_stacked_cancellation_model,
+    tune_catboost_cancellation,
+    tune_lgb_cancellation,
+    tune_xgb_cancellation,
+)
+from src.preprocessing import compute_group_rates, target_encode_column
 from src.analytics import estimate_staffing, estimate_profit
 from src.evaluation import regression_metrics, classification_report_dict
+from src.model_specs import FORECAST_LAGS
 from src.visualization import (
     plot_revenue_over_time,
     plot_forecast_vs_actual,
@@ -73,7 +85,7 @@ def run_pipeline():
         train, test = series.iloc[:split], series.iloc[split:]
 
         # XGBoost
-        xgb_m, xgb_cols = train_xgb_forecaster(train, lags=[1, 7, 14, 30])
+        xgb_m, xgb_cols = train_xgb_forecaster(train, lags=FORECAST_LAGS)
         xgb_preds = forecast_xgb(xgb_m, xgb_cols, train, periods=len(test))
         xgb_preds.index = test.index
         m = regression_metrics(test.values, xgb_preds.values)
@@ -92,7 +104,7 @@ def run_pipeline():
                                 output_dir=OUTPUT_DIR, lower=prophet_lower, upper=prophet_upper)
 
         # Future forecast using XGBoost (trained on full series)
-        full_model, full_cols = train_xgb_forecaster(series, lags=[1, 7, 14, 30])
+        full_model, full_cols = train_xgb_forecaster(series, lags=FORECAST_LAGS)
         future = forecast_xgb(full_model, full_cols, series, periods=FORECAST_PERIODS)
         return future
 
@@ -103,21 +115,71 @@ def run_pipeline():
     # 4. CANCELLATION PREDICTION
     # ------------------------------------------------------------------ #
     print("\n[4/6] Training cancellation classifiers...")
-    X, y_cancel, _ = encode_categoricals(drop_leaky_features(df))
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y_cancel, test_size=0.2, random_state=42, stratify=y_cancel
+    df_sorted = df.sort_values("arrival_date")
+    n_test = max(1, int(len(df_sorted) * 0.2))
+    df_train_raw = df_sorted.iloc[:-n_test]
+
+    # Fix leakage: group cancel rates from training rows only
+    df_with_rates = compute_group_rates(df_train_raw, df_sorted)
+
+    X, y_cancel, _ = encode_categoricals(drop_leaky_features(df_with_rates))
+
+    # Target-encode high-cardinality columns using training rows only
+    global_cancel_mean = float(df_train_raw["is_canceled"].mean()) if "is_canceled" in df_train_raw.columns else 0.0
+    for col in TARGET_ENCODED_COLS:
+        if col in X.columns and col in df_train_raw.columns:
+            rate_map = df_train_raw.groupby(col)["is_canceled"].mean().to_dict()
+            original_col = df_with_rates[col] if col in df_with_rates.columns else None
+            if original_col is not None:
+                X[col] = original_col.values
+                X[col] = X[col].map(rate_map).fillna(global_cancel_mean).astype(float)
+
+    X_tr = X.iloc[:-n_test]
+    y_tr = y_cancel.iloc[:-n_test]
+    X_te = X.iloc[-n_test:]
+    y_te = y_cancel.iloc[-n_test:]
+    feature_columns = list(X.columns)
+
+    spw = compute_scale_pos_weight(y_tr.values)
+    best_xgb_params = tune_xgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
+    best_lgb_params = tune_lgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
+    best_cb_params = tune_catboost_cancellation(
+        X_tr.values, y_tr.values, scale_pos_weight=spw, cat_feature_indices=[]
     )
-    cancel_models = train_cancellation_models(X_tr.values, y_tr.values)
+
+    cancel_models = train_cancellation_models_balanced(
+        X_tr.values, y_tr.values,
+        scale_pos_weight=spw,
+        xgb_params=best_xgb_params,
+        lgb_params=best_lgb_params,
+        catboost_params=best_cb_params,
+        feature_columns=feature_columns,
+    )
+
+    stacked_meta = train_stacked_cancellation_model(cancel_models, X_tr.values, y_tr.values)
+    cancel_models["stacked_meta"] = stacked_meta
+
+    stacked_proba = predict_stacked_proba(stacked_meta, cancel_models, X_te.values)
+    optimal_threshold, _ = find_optimal_threshold(y_te.values, stacked_proba)
+    cancel_models["optimal_threshold"] = optimal_threshold
 
     for name, model in cancel_models.items():
-        y_pred = model.predict(X_te.values)
+        if name in ("stacked_meta", "optimal_threshold"):
+            continue
         y_prob = predict_cancellation_proba(model, X_te.values)
+        y_pred = (y_prob >= optimal_threshold).astype(int)
         m = classification_report_dict(y_te.values, y_pred, y_prob)
         print(f"  {name:<15s}  Acc={m['accuracy']:.3f}  "
               f"Prec={m['precision']:.3f}  Rec={m['recall']:.3f}  "
               f"F1={m['f1']:.3f}  ROC-AUC={m['roc_auc']:.3f}")
 
-    plot_feature_importance(cancel_models["xgboost"], list(X.columns), output_dir=OUTPUT_DIR)
+    stacked_pred = (stacked_proba >= optimal_threshold).astype(int)
+    from sklearn.metrics import accuracy_score, roc_auc_score
+    print(f"  {'stacked':<15s}  Acc={accuracy_score(y_te.values, stacked_pred):.3f}  "
+          f"ROC-AUC={roc_auc_score(y_te.values, stacked_proba):.3f}  "
+          f"(threshold={optimal_threshold:.2f})")
+
+    plot_feature_importance(cancel_models["xgboost"], feature_columns, output_dir=OUTPUT_DIR)
     plot_cancellation_roc(cancel_models, X_te.values, y_te.values, output_dir=OUTPUT_DIR)
 
     # ------------------------------------------------------------------ #

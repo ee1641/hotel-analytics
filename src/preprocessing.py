@@ -100,6 +100,28 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["adr_vs_hotel_mean"] = 1.0
 
+    # Previous cancellation rate ratio — more informative than raw counts alone
+    if "previous_cancellations" in df.columns and "previous_bookings_not_canceled" in df.columns:
+        df["previous_cancellation_rate"] = (
+            df["previous_cancellations"]
+            / (df["previous_cancellations"] + df["previous_bookings_not_canceled"] + 1)
+        )
+
+    # Log-transform lead time — cancellation risk grows exponentially with lead time
+    if "lead_time" in df.columns:
+        df["log_lead_time"] = np.log1p(df["lead_time"])
+
+    # Deposit-type binary flag — no-deposit bookings cancel at far higher rates
+    if "deposit_type" in df.columns:
+        df["deposit_is_no_deposit"] = (df["deposit_type"] == "No Deposit").astype(int)
+        # High-risk interaction: no deposit AND long lead time
+        if "lead_time" in df.columns:
+            df["no_deposit_long_lead"] = df["deposit_is_no_deposit"] * (df["lead_time"] > 30).astype(int)
+
+    # NOTE: hotel_cancel_rate_mean and market_segment_cancel_rate_mean are intentionally
+    # NOT computed here. They are computed in services.py after the train/test split so
+    # that test-set labels cannot leak into the training features.
+
     return df
 
 
@@ -230,6 +252,44 @@ def encode_categoricals(df: pd.DataFrame):
     feature_df = feature_df.select_dtypes(exclude="object")
 
     return feature_df, y_cancel, y_noshow
+
+
+def target_encode_column(
+    train_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    col: str,
+    target_col: str = "is_canceled",
+    global_mean: float | None = None,
+) -> pd.Series:
+    """
+    Mean target rate per category, computed on train_df only.
+    Unseen categories in full_df fall back to the global training mean.
+    Use after the train/test split to prevent label leakage.
+    """
+    rates = train_df.groupby(col)[target_col].mean()
+    if global_mean is None:
+        global_mean = float(train_df[target_col].mean())
+    return full_df[col].map(rates).fillna(global_mean).astype(float)
+
+
+def compute_group_rates(
+    train_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute hotel and market_segment cancel rate means using only training rows,
+    then join them onto full_df (covers both train and test splits).
+    Returns full_df with hotel_cancel_rate_mean and market_segment_cancel_rate_mean columns added.
+    """
+    global_mean = float(train_df["is_canceled"].mean()) if "is_canceled" in train_df.columns else 0.0
+    result = full_df.copy()
+    if "hotel" in train_df.columns and "is_canceled" in train_df.columns:
+        hotel_rates = train_df.groupby("hotel")["is_canceled"].mean()
+        result["hotel_cancel_rate_mean"] = full_df["hotel"].map(hotel_rates).fillna(global_mean)
+    if "market_segment" in train_df.columns and "is_canceled" in train_df.columns:
+        seg_rates = train_df.groupby("market_segment")["is_canceled"].mean()
+        result["market_segment_cancel_rate_mean"] = full_df["market_segment"].map(seg_rates).fillna(global_mean)
+    return result
 
 
 def drop_leaky_features(df: pd.DataFrame) -> pd.DataFrame:

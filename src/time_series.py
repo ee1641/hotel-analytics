@@ -3,6 +3,7 @@ Date construction and daily time-series aggregation for hotel bookings.
 """
 import logging
 
+import numpy as np
 import pandas as pd
 
 from src.preprocessing import ensure_revenue_columns
@@ -72,6 +73,21 @@ def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
     full_range = pd.date_range(grouped.index.min(), grouped.index.max(), freq="D")
     grouped = grouped.reindex(full_range, fill_value=0)
     grouped.index.name = "arrival_date"
+
+    # Implied ADR: average daily rate derived from booked revenue / bookings
+    bookings = grouped["daily_bookings"].replace(0, np.nan)
+    grouped["implied_adr"] = (grouped["daily_booked_revenue"] / bookings).fillna(0.0)
+
+    # Net demand: bookings that are not cancelled; cleaner signal for demand forecasting
+    grouped["net_daily_bookings"] = (
+        grouped["daily_bookings"] - grouped["daily_cancellations"]
+    ).clip(lower=0)
+
+    # Daily cancellation rate: lagged version is useful as a demand model extra_feature
+    grouped["daily_cancellation_rate"] = (
+        grouped["daily_cancellations"] / bookings
+    ).fillna(0.0)
+
     return grouped
 
 

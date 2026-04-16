@@ -71,7 +71,7 @@ def test_survival_profile_is_monotonic():
 
 def test_tune_xgb_returns_valid_params(synth):
     X_tr, _, y_tr, _ = synth
-    params = tune_xgb_cancellation(X_tr, y_tr, scale_pos_weight=1.0, n_iter=2, cv=2)
+    params = tune_xgb_cancellation(X_tr, y_tr, scale_pos_weight=1.0, n_iter=2, n_splits=2)
     assert isinstance(params, dict)
     for key in ("n_estimators", "max_depth", "learning_rate"):
         assert key in params

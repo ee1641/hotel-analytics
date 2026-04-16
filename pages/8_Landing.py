@@ -40,11 +40,11 @@ st.divider()
 # CTA buttons
 cta_col1, cta_col2 = st.columns(2)
 with cta_col1:
-    if st.button("Try the Demo →", type="primary", use_container_width=True):
+    if st.button("Try the Demo →", type="primary", width='stretch'):
         track_event("button_click", "landing", {"button": "try_demo"})
         st.switch_page("pages/1_Overview.py")
 with cta_col2:
-    if st.button("Get Started (Contact Us)", use_container_width=True):
+    if st.button("Get Started (Contact Us)", width='stretch'):
         track_event("button_click", "landing", {"button": "get_started"})
         st.info("Email us at: analytics@yourhotel.com")
 

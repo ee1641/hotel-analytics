@@ -28,12 +28,13 @@ st.warning(
     "bookings before their arrival date. Results should not be used for real operational decisions."
 )
 
-try:
-    df, _ = load_and_prepare_data()
-    models = get_or_train_models()
-except Exception as e:
-    st.error(f"Failed to load data or models: {e}")
-    st.stop()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    try:
+        df, _ = load_and_prepare_data()
+        models = get_or_train_models()
+    except Exception as e:
+        st.error(f"Failed to load data or models: {e}")
+        st.stop()
 
 cancel_model = models["cancel_models"]["xgboost"]
 feature_columns = models["feature_columns"]
@@ -127,7 +128,7 @@ else:
             scored[display_cols].head(25).style.format(
                 {c: "{:.1%}" if c == "cancel_probability" else ("€{:.0f}" if c == "adr" else "{}") for c in display_cols}
             ),
-            use_container_width=True,
+            width='stretch',
         )
         st.caption(f"{len(day_bookings)} active bookings for this date. Showing top 25 by risk.")
     except Exception as e:

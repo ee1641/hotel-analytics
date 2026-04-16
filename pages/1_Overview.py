@@ -28,12 +28,13 @@ if st.session_state.get("defaulted_columns"):
         + ". Results may not reflect real values."
     )
 
-try:
-    df, daily_df = load_and_prepare_data()
-    models = get_or_train_models()
-except Exception as e:
-    st.error(f"Failed to load data or models: {e}")
-    st.stop()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    try:
+        df, daily_df = load_and_prepare_data()
+        models = get_or_train_models()
+    except Exception as e:
+        st.error(f"Failed to load data or models: {e}")
+        st.stop()
 
 df = models.get("df_with_expected_revenue", df)
 daily_df = models.get("daily_revenue_views", daily_df)
@@ -104,7 +105,7 @@ fig_rev = px.line(
     },
 )
 fig_rev.update_layout(hovermode="x unified", height=350)
-st.plotly_chart(fig_rev, use_container_width=True)
+st.plotly_chart(fig_rev, width='stretch')
 
 st.subheader("Daily Bookings Over Time")
 fig_bk = px.line(
@@ -115,7 +116,7 @@ fig_bk = px.line(
     color_discrete_sequence=["darkorange"],
 )
 fig_bk.update_layout(hovermode="x unified", height=350)
-st.plotly_chart(fig_bk, use_container_width=True)
+st.plotly_chart(fig_bk, width='stretch')
 
 st.subheader("Monthly Cancellation Breakdown")
 if len(df_filtered) > 0:
@@ -138,7 +139,7 @@ if len(df_filtered) > 0:
     )
     fig_m.update_layout(height=300, xaxis_tickangle=-45)
     fig_m.update_coloraxes(showscale=False)
-    st.plotly_chart(fig_m, use_container_width=True)
+    st.plotly_chart(fig_m, width='stretch')
 
 if cancel_rate > 0.40:
     st.warning(f"High cancellation rate detected: **{cancel_rate:.1%}**. Consider reviewing deposit policies.")
@@ -171,7 +172,7 @@ if cross:
             cross_df = _pd.DataFrame(rows)
             st.dataframe(
                 cross_df.style.format({"Accuracy": "{:.3f}", "ROC-AUC": "{:.3f}"}),
-                use_container_width=True,
+                width='stretch',
             )
         else:
             st.info("Cross-dataset evaluation results not available.")

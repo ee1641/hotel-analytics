@@ -94,7 +94,7 @@ def small_hotel_df():
 
 def test_finetune_returns_three_models(small_hotel_df):
     models, metrics = finetune_cancellation_model(small_hotel_df)
-    assert set(models.keys()) == {"logistic", "random_forest", "xgboost"}
+    assert {"logistic", "random_forest", "xgboost"}.issubset(set(models.keys()))
 
 
 def test_finetune_metrics_have_roc_auc(small_hotel_df):

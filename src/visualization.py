@@ -92,7 +92,10 @@ def plot_cancellation_roc(
     """ROC curves for all cancellation models overlaid on one axes."""
     _ensure_dir(output_dir)
     fig, ax = plt.subplots(figsize=(8, 6))
+    _skip = {"stacked_meta", "optimal_threshold", "target_encode_maps", "global_cancel_mean"}
     for name, model in models.items():
+        if name in _skip or not hasattr(model, "predict_proba"):
+            continue
         proba = model.predict_proba(X_test)[:, 1]
         fpr, tpr, _ = roc_curve(y_test, proba)
         roc_auc = auc(fpr, tpr)

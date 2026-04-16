@@ -45,13 +45,14 @@ if st.session_state.get("defaulted_columns"):
         + ". Results may not reflect real values."
     )
 
-try:
-    df, daily_df = load_and_prepare_data()
-    models = get_or_train_models()
-    eval_metrics = models["eval_metrics"]
-except Exception as e:
-    st.error(f"Failed to load data or models: {e}")
-    st.stop()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    try:
+        df, daily_df = load_and_prepare_data()
+        models = get_or_train_models()
+        eval_metrics = models["eval_metrics"]
+    except Exception as e:
+        st.error(f"Failed to load data or models: {e}")
+        st.stop()
 
 df = models.get("df_with_expected_revenue", df)
 daily_df = models.get("daily_revenue_views", daily_df)
@@ -237,7 +238,7 @@ if _has_tuning_data:
 
         st.dataframe(
             _tuning_df.style.applymap(_color_gain, subset=["Gain (pts)"]),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -257,9 +258,10 @@ _snapshot_60d_ts = _snapshot_ts - pd.Timedelta(days=30)
 
 def _count_active_otb(data, as_of_ts, future_dates):
     if "reservation_status_date" in data.columns:
+        rsd = pd.to_datetime(data["reservation_status_date"], errors="coerce")
         _a = data[
             (data["is_canceled"] == 0) |
-            ((data["is_canceled"] == 1) & (data["reservation_status_date"] > as_of_ts))
+            ((data["is_canceled"] == 1) & (rsd > as_of_ts))
         ]
     else:
         _a = data[data["is_canceled"] == 0]
@@ -358,7 +360,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     height=430,
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 with st.expander("View 30-Day Forecast Data"):
     forecast_df = pd.DataFrame(
@@ -371,7 +373,7 @@ with st.expander("View 30-Day Forecast Data"):
     if show_ci and band_df is not None:
         forecast_df["Low"] = band_df["yhat_lower"].round(2).values
         forecast_df["High"] = band_df["yhat_upper"].round(2).values
-    st.dataframe(forecast_df, use_container_width=True)
+    st.dataframe(forecast_df, width='stretch')
 
 st.divider()
 st.subheader("Pickup / Pace Report")
@@ -418,12 +420,12 @@ pace_fig.update_layout(
     yaxis_title="Bookings On The Books",
     height=360,
 )
-st.plotly_chart(pace_fig, use_container_width=True)
+st.plotly_chart(pace_fig, width='stretch')
 st.dataframe(
     pickup_report.assign(
         pace_vs_stly=pickup_report["pace_vs_stly"].map(lambda v: None if pd.isna(v) else round(v, 3))
     ),
-    use_container_width=True,
+    width='stretch',
 )
 
 st.divider()
@@ -480,7 +482,7 @@ else:
         pricing_df.assign(
             pace_vs_stly=pricing_df["pace_vs_stly"].map(lambda v: None if pd.isna(v) else round(v, 3))
         ),
-        use_container_width=True,
+        width='stretch',
     )
 
 st.divider()
@@ -511,6 +513,6 @@ try:
         height=360,
         hovermode="x unified",
     )
-    st.plotly_chart(fig_rev_stay, use_container_width=True)
+    st.plotly_chart(fig_rev_stay, width='stretch')
 except Exception as exc:
     st.warning(f"Could not compute stay-night revenue: {exc}")

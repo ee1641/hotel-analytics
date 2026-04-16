@@ -40,12 +40,13 @@ if st.session_state.get("defaulted_columns"):
         + ". Results may not reflect real values."
     )
 
-try:
-    df, daily_df = load_and_prepare_data()
-    models = get_or_train_models()
-except Exception as e:
-    st.error(f"Failed to load data or models: {e}")
-    st.stop()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    try:
+        df, daily_df = load_and_prepare_data()
+        models = get_or_train_models()
+    except Exception as e:
+        st.error(f"Failed to load data or models: {e}")
+        st.stop()
 
 daily_df = models.get("daily_revenue_views", daily_df)
 xgb_model, feat_cols = models["xgb_demand"]
@@ -136,7 +137,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     height=430,
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 forecast_df = pd.DataFrame(
     {
@@ -149,7 +150,7 @@ forecast_df = pd.DataFrame(
 if demand_band_df is not None:
     forecast_df["Low"] = demand_band_df["yhat_lower"].round(1).values
     forecast_df["High"] = demand_band_df["yhat_upper"].round(1).values
-st.dataframe(forecast_df, use_container_width=True)
+st.dataframe(forecast_df, width='stretch')
 
 st.divider()
 st.subheader("Market Segment Demand Outlook")
@@ -184,7 +185,7 @@ else:
         .reset_index()
         .rename(columns={"yhat": "30d_forecast_bookings"})
     )
-    st.dataframe(seg_summary, use_container_width=True)
+    st.dataframe(seg_summary, width='stretch')
 
     seg_chart = go.Figure()
     for segment in seg_summary["segment"]:
@@ -204,7 +205,7 @@ else:
         yaxis_title="Forecast Bookings",
         height=380,
     )
-    st.plotly_chart(seg_chart, use_container_width=True)
+    st.plotly_chart(seg_chart, width='stretch')
 
 if not segment_mix_df.empty:
     mix_summary = (
@@ -217,7 +218,7 @@ if not segment_mix_df.empty:
     mix_cols = st.columns(min(len(mix_summary), 4) or 1)
     for idx, row in mix_summary.head(4).iterrows():
         mix_cols[idx].metric(row["segment"], f"{row['segment_share']:.1%}")
-    st.dataframe(segment_mix_df, use_container_width=True)
+    st.dataframe(segment_mix_df, width='stretch')
 
 st.divider()
 st.subheader("Occupied Rooms by Stay Night")
@@ -250,6 +251,6 @@ try:
         height=360,
         hovermode="x unified",
     )
-    st.plotly_chart(fig_occ, use_container_width=True)
+    st.plotly_chart(fig_occ, width='stretch')
 except Exception as exc:
     st.warning(f"Could not compute stay-night occupancy: {exc}")

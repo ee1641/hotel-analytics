@@ -29,7 +29,8 @@ st.markdown(
     "Score a booking for cancellation risk and estimate how likely it is to remain alive as arrival approaches."
 )
 
-models = get_or_train_models()
+with st.spinner("Training models… this may take a few minutes on first run."):
+    models = get_or_train_models()
 cancel_models = models["cancel_models"]
 survival_model = models.get("cancel_survival_model")
 feature_columns = models["feature_columns"]
@@ -187,8 +188,8 @@ if submitted:
             height=360,
             yaxis=dict(range=[0, 1]),
         )
-        st.plotly_chart(chart, use_container_width=True)
-        st.dataframe(survival_profile, use_container_width=True)
+        st.plotly_chart(chart, width='stretch')
+        st.dataframe(survival_profile, width='stretch')
 
     if model_name == "xgboost":
         with st.expander("Top risk factors for this prediction (SHAP)"):
@@ -212,7 +213,7 @@ if submitted:
                 )
                 st.dataframe(
                     shap_row[["Feature", "Direction", "SHAP Value"]].style.format({"SHAP Value": "{:.4f}"}),
-                    use_container_width=True,
+                    width='stretch',
                 )
             except Exception as e:
                 st.info(f"SHAP explanation unavailable: {e}")

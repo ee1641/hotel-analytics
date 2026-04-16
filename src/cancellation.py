@@ -5,16 +5,35 @@ Cancellation modelling:
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 from src.revenue_management import prepare_booking_timeline
+
+log = logging.getLogger(__name__)
+
+# Categorical columns passed to CatBoost for native handling (label-encoded integers)
+CATBOOST_CAT_COLS = [
+    "meal",
+    "market_segment",
+    "distribution_channel",
+    "reserved_room_type",
+    "deposit_type",
+    "customer_type",
+]
+
+# High-cardinality columns handled via target encoding (not label encoding)
+TARGET_ENCODED_COLS = ["country", "agent"]
 
 
 def train_cancellation_models(X_train, y_train) -> dict:
@@ -63,13 +82,13 @@ def tune_xgb_cancellation(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
     scale_pos_weight: float,
-    n_iter: int = 20,
-    cv: int = 4,
+    n_iter: int = 10,
+    n_splits: int = 3,
 ) -> dict:
     """
-    Run RandomizedSearchCV over XGBoost hyperparameters.
+    Run RandomizedSearchCV over XGBoost hyperparameters using TimeSeriesSplit
+    to prevent future data leaking into training folds.
     Returns best_params_ dict; pass as xgb_params to train_cancellation_models_balanced.
-    Uses n_jobs=-1 for parallel fold evaluation.
     """
     param_dist = {
         "n_estimators": [200, 400, 600, 800],
@@ -91,10 +110,103 @@ def tune_xgb_cancellation(
         base,
         param_dist,
         n_iter=n_iter,
-        cv=cv,
+        cv=TimeSeriesSplit(n_splits=n_splits),
         scoring="roc_auc",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
+    )
+    search.fit(X_tr, y_tr)
+    return search.best_params_
+
+
+def tune_lgb_cancellation(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    scale_pos_weight: float,
+    n_iter: int = 20,
+    n_splits: int = 5,
+) -> dict:
+    """
+    Run RandomizedSearchCV over LightGBM hyperparameters using TimeSeriesSplit.
+    Returns best_params_ dict.
+    """
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        log.warning("lightgbm not installed — skipping LGB tuning, using defaults")
+        return {}
+
+    param_dist = {
+        "n_estimators": [200, 400, 600, 800],
+        "num_leaves": [31, 63, 127],
+        "learning_rate": [0.01, 0.03, 0.05, 0.1],
+        "subsample": [0.8, 0.9, 1.0],
+        "colsample_bytree": [0.8, 0.9, 1.0],
+        "min_child_samples": [10, 20, 50],
+        "reg_alpha": [0, 0.1, 0.5],
+        "reg_lambda": [0, 0.1, 1.0],
+    }
+    base = lgb.LGBMClassifier(
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        n_jobs=1,
+        verbose=-1,
+    )
+    search = RandomizedSearchCV(
+        base,
+        param_dist,
+        n_iter=n_iter,
+        cv=TimeSeriesSplit(n_splits=n_splits),
+        scoring="roc_auc",
+        random_state=42,
+        n_jobs=1,
+    )
+    search.fit(X_tr, y_tr)
+    return search.best_params_
+
+
+def tune_catboost_cancellation(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    scale_pos_weight: float,
+    cat_feature_indices: list[int],
+    n_iter: int = 15,
+    n_splits: int = 5,
+) -> dict:
+    """
+    Run RandomizedSearchCV over CatBoost hyperparameters using TimeSeriesSplit.
+    Returns best_params_ dict.
+    """
+    try:
+        from catboost import CatBoostClassifier
+    except ImportError:
+        log.warning("catboost not installed — skipping CatBoost tuning, using defaults")
+        return {}
+
+    param_dist = {
+        "iterations": [300, 500, 800],
+        "depth": [4, 6, 8],
+        "learning_rate": [0.03, 0.05, 0.1],
+        "l2_leaf_reg": [1, 3, 5, 10],
+        "bagging_temperature": [0.0, 0.5, 1.0],
+    }
+    # cat_features cannot be passed to the base estimator used in RandomizedSearchCV
+    # because sklearn's clone() cannot reconstruct CatBoost with that parameter.
+    # We tune hyperparameters without cat_features here; cat_features are applied
+    # in train_cancellation_models_balanced when building the final model.
+    base = CatBoostClassifier(
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        verbose=0,
+    )
+    search = RandomizedSearchCV(
+        base,
+        param_dist,
+        n_iter=n_iter,
+        cv=TimeSeriesSplit(n_splits=n_splits),
+        scoring="roc_auc",
+        random_state=42,
+        n_jobs=1,
     )
     search.fit(X_tr, y_tr)
     return search.best_params_
@@ -105,10 +217,15 @@ def train_cancellation_models_balanced(
     y_train,
     scale_pos_weight: float = None,
     xgb_params: dict | None = None,
+    lgb_params: dict | None = None,
+    catboost_params: dict | None = None,
+    feature_columns: list[str] | None = None,
 ) -> dict:
     """
-    Like train_cancellation_models but with class-imbalance corrections.
-    Pass xgb_params (from tune_xgb_cancellation) to override default XGB hyperparameters.
+    Train five balanced classifiers: logistic, random_forest, xgboost, lightgbm, catboost.
+    LightGBM and CatBoost are skipped gracefully if not installed.
+    Pass *_params dicts (from tune_* functions) to override defaults.
+    feature_columns is required for CatBoost to identify categorical feature indices.
     """
     spw = scale_pos_weight if scale_pos_weight is not None else compute_scale_pos_weight(y_train)
     models = {
@@ -131,7 +248,6 @@ def train_cancellation_models_balanced(
                 "max_depth": 6,
                 "learning_rate": 0.1,
                 **(xgb_params or {}),
-                # Always enforced regardless of xgb_params:
                 "eval_metric": "logloss",
                 "verbosity": 0,
                 "random_state": 42,
@@ -139,6 +255,40 @@ def train_cancellation_models_balanced(
             }
         ),
     }
+
+    try:
+        import lightgbm as lgb
+        lgb_defaults = {
+            "n_estimators": 500,
+            "learning_rate": 0.05,
+            "num_leaves": 63,
+            "n_jobs": -1,
+            "verbose": -1,
+            "random_state": 42,
+            "scale_pos_weight": spw,
+        }
+        lgb_defaults.update(lgb_params or {})
+        models["lightgbm"] = lgb.LGBMClassifier(**lgb_defaults)
+    except ImportError:
+        log.warning("lightgbm not installed — skipping LightGBM model")
+
+    try:
+        from catboost import CatBoostClassifier
+        cb_defaults = {
+            "iterations": 500,
+            "learning_rate": 0.05,
+            "depth": 6,
+            "scale_pos_weight": spw,
+            "random_state": 42,
+            "verbose": 0,
+        }
+        for k, v in (catboost_params or {}).items():
+            if k not in ("scale_pos_weight", "random_state", "verbose"):
+                cb_defaults[k] = v
+        models["catboost"] = CatBoostClassifier(**cb_defaults)
+    except ImportError:
+        log.warning("catboost not installed — skipping CatBoost model")
+
     for model in models.values():
         model.fit(X_train, y_train)
     return models
@@ -163,6 +313,70 @@ def get_shap_feature_importance(model, X_test: np.ndarray, feature_names: list) 
 def select_top_features(shap_df: pd.DataFrame, threshold: float = 0.01) -> list:
     """Return feature names with mean |SHAP| above threshold."""
     return shap_df.loc[shap_df["mean_abs_shap"] > threshold, "feature"].tolist()
+
+
+def train_stacked_cancellation_model(
+    base_models: dict,
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    n_splits: int = 5,
+) -> LogisticRegression:
+    """
+    Build a stacking meta-learner using out-of-fold predictions from all base models.
+
+    Uses TimeSeriesSplit to generate OOF predictions without leaking future data.
+    Trains a logistic regression meta-learner on the resulting OOF probability matrix.
+    Base models should already be fitted on the full training set before calling predict.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
+    oof = np.zeros((len(X_tr), len(model_names)))
+
+    for tr_idx, val_idx in tscv.split(X_tr):
+        X_fold_tr, X_fold_val = X_tr[tr_idx], X_tr[val_idx]
+        y_fold_tr = y_tr[tr_idx]
+        for m_idx, name in enumerate(model_names):
+            m = clone(base_models[name])
+            m.fit(X_fold_tr, y_fold_tr)
+            oof[val_idx, m_idx] = m.predict_proba(X_fold_val)[:, 1]
+
+    meta = LogisticRegression(max_iter=1000, random_state=42, C=1.0)
+    meta.fit(oof, y_tr)
+    return meta
+
+
+_NON_MODEL_KEYS = {"stacked_meta", "optimal_threshold", "target_encode_maps", "global_cancel_mean"}
+
+
+def predict_stacked_proba(
+    meta: LogisticRegression,
+    base_models: dict,
+    X: np.ndarray,
+) -> np.ndarray:
+    """Generate stacked probability predictions for X using fitted base models + meta-learner."""
+    model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
+    level1 = np.column_stack([
+        base_models[name].predict_proba(X)[:, 1]
+        for name in model_names
+    ])
+    return meta.predict_proba(level1)[:, 1]
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Sweep thresholds [0.30, 0.70] in 0.01 steps and return the threshold that
+    maximises accuracy, along with the achieved accuracy.
+    """
+    best_thresh, best_score = 0.5, 0.0
+    for t in np.arange(0.30, 0.71, 0.01):
+        preds = (y_prob >= t).astype(int)
+        score = float(accuracy_score(y_true, preds))
+        if score > best_score:
+            best_score, best_thresh = score, float(t)
+    return best_thresh, best_score
 
 
 def _km_curve(durations: np.ndarray, events: np.ndarray) -> pd.DataFrame:

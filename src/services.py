@@ -14,16 +14,22 @@ from sklearn.preprocessing import LabelEncoder
 
 from src import model_cache
 from src.cancellation import (
+    TARGET_ENCODED_COLS,
     compute_scale_pos_weight,
+    find_optimal_threshold,
     get_shap_feature_importance,
+    predict_stacked_proba,
     select_top_features,
     train_cancellation_models_balanced,
     train_cancellation_survival_model,
+    train_stacked_cancellation_model,
+    tune_catboost_cancellation,
+    tune_lgb_cancellation,
     tune_xgb_cancellation,
 )
 from src.cancellation_evaluation import evaluate_cross_dataset
 from src.config import APP_CONFIG
-from src.evaluation import regression_metrics, ts_cross_val_scores
+from src.evaluation import forecast_error_breakdown, regression_metrics, ts_cross_val_scores
 from src.forecasting import (
     forecast_prophet,
     forecast_xgb,
@@ -35,6 +41,8 @@ from src.forecasting import (
     train_xgb_forecaster_with_intervals,
 )
 from src.ingestion import load_cancellation_prediction_csv
+from src.trends import build_trends_features, TRENDS_FEATURE_COLS
+from src.revenue_management import build_otb_feature_matrix
 from src.model_specs import (
     CANCELLATION_MODEL_VERSION,
     DIRECT_FORECAST_MODEL_VERSION,
@@ -49,12 +57,14 @@ from src.preprocessing import (
     _CATEGORICAL_COLS,
     add_temporal_features,
     clean_data,
+    compute_group_rates,
     drop_leaky_features,
     encode_categoricals,
     engineer_features,
     load_data,
+    target_encode_column,
 )
-from src.time_series import aggregate_daily, build_arrival_date
+from src.time_series import aggregate_daily, aggregate_daily_by_hotel_type, build_arrival_date
 
 DATA_PATH = "hotel_bookings.csv"
 log = logging.getLogger(__name__)
@@ -101,6 +111,46 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
     dem_series = daily_df["daily_bookings"]
 
     # ------------------------------------------------------------------
+    # Demand extra features — cancel rate lag, Google Trends, OTB (30d/60d)
+    # Built once here; reused by both the full demand model and the eval block.
+    # Only otb_30d and otb_60d are included: for a 30-day-ahead forecast these
+    # are the only OTB snapshots that are available at prediction time without
+    # leaking future booking information.
+    # ------------------------------------------------------------------
+    _cancel_rate_raw = daily_df["daily_cancellation_rate"]
+    _cancel_rate_feat = pd.DataFrame(
+        {"cancel_rate_lag7": _cancel_rate_raw.shift(7).fillna(0.0)},
+        index=daily_df.index,
+    )
+    try:
+        _trends_feat = build_trends_features(daily_df.index)
+    except Exception as exc:
+        log.warning("Google Trends unavailable, skipping trends features: %s", exc)
+        _trends_feat = pd.DataFrame(0.0, index=daily_df.index, columns=TRENDS_FEATURE_COLS)
+
+    try:
+        _otb_raw = build_otb_feature_matrix(df, lead_times=[30, 60])
+        _otb_feat = _otb_raw[["otb_30d", "otb_60d"]].reindex(daily_df.index, fill_value=0)
+    except Exception as exc:
+        log.warning("OTB feature build failed, skipping: %s", exc)
+        _otb_raw = pd.DataFrame(0.0, index=daily_df.index, columns=["otb_30d", "otb_60d"])
+        _otb_feat = _otb_raw.copy()
+
+    # STLY OTB: shift the OTB index forward 364 days so each row maps to
+    # "this year's equivalent arrival date", giving same-time-last-year counts
+    # without a second full loop. Pace ratio = current / STLY (how far ahead/behind).
+    _otb_stly = _otb_raw[["otb_30d", "otb_60d"]].copy()
+    _otb_stly.index = _otb_stly.index + pd.Timedelta(days=364)
+    _otb_stly.columns = ["otb_30d_stly", "otb_60d_stly"]
+    _otb_stly = _otb_stly.reindex(daily_df.index, fill_value=0)
+
+    _pace_feat = pd.DataFrame(index=daily_df.index)
+    _pace_feat["pace_ratio_30d"] = _otb_feat["otb_30d"] / _otb_stly["otb_30d_stly"].clip(lower=1)
+    _pace_feat["pace_ratio_60d"] = _otb_feat["otb_60d"] / _otb_stly["otb_60d_stly"].clip(lower=1)
+
+    demand_extra = pd.concat([_cancel_rate_feat, _trends_feat, _otb_feat, _otb_stly, _pace_feat], axis=1)
+
+    # ------------------------------------------------------------------
     # Revenue forecasting
     # ------------------------------------------------------------------
     if _artifact_current("xgb_revenue", FORECAST_MODEL_VERSION, models_dir):
@@ -137,7 +187,9 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
     if _artifact_current("xgb_demand", FORECAST_MODEL_VERSION, models_dir):
         results["xgb_demand"] = model_cache.load_artifact("xgb_demand", models_dir=models_dir)
     else:
-        xgb_d, xgb_d_cols = train_xgb_forecaster(dem_series, lags=FORECAST_LAGS)
+        xgb_d, xgb_d_cols = train_xgb_forecaster(
+            dem_series, lags=FORECAST_LAGS, extra_features=demand_extra
+        )
         results["xgb_demand"] = (xgb_d, xgb_d_cols)
         _save_versioned("xgb_demand", (xgb_d, xgb_d_cols), FORECAST_MODEL_VERSION, models_dir)
 
@@ -175,16 +227,50 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         # Sort by arrival_date for time-based split — prevents future booking
         # info leaking into the cancellation model's training data.
         df_sorted = df.sort_values("arrival_date")
-        df_cancel = drop_leaky_features(df_sorted)
+
+        # Time-based 80/20 split on the raw (pre-encoded) dataframe so we can
+        # compute group rates and target encoding using training rows only.
+        n_test = max(1, int(len(df_sorted) * 0.2))
+        df_train_raw = df_sorted.iloc[:-n_test]
+        df_full_raw = df_sorted  # both splits needed for group rate join
+
+        # Step 1: Compute hotel / market_segment cancel rates on training rows only
+        df_full_with_rates = compute_group_rates(df_train_raw, df_full_raw)
+
+        # Step 2: Encode features — label-encode low-cardinality categoricals,
+        # target-encode high-cardinality ones (country, agent) using training rows only.
+        df_cancel = drop_leaky_features(df_full_with_rates)
         label_encoders = {}
         for col in _CATEGORICAL_COLS:
-            if col in df_cancel.columns:
+            if col in df_cancel.columns and col not in TARGET_ENCODED_COLS:
                 le = LabelEncoder()
                 df_cancel = df_cancel.copy()
                 df_cancel[col] = le.fit_transform(df_cancel[col].astype(str))
                 label_encoders[col] = le
 
-        X, y_cancel, _ = encode_categoricals(drop_leaky_features(df_sorted))
+        # Target-encode country and agent using training rows only
+        global_cancel_mean = float(df_train_raw["is_canceled"].mean()) if "is_canceled" in df_train_raw.columns else 0.0
+        target_encode_maps = {}
+        df_cancel = df_cancel.copy()
+        for col in TARGET_ENCODED_COLS:
+            if col in df_cancel.columns and col in df_train_raw.columns and "is_canceled" in df_train_raw.columns:
+                encoded = target_encode_column(df_train_raw, df_full_with_rates, col, global_mean=global_cancel_mean)
+                df_cancel[col] = encoded.values
+                # Store the rate map for inference-time use
+                target_encode_maps[col] = df_train_raw.groupby(col)["is_canceled"].mean().to_dict()
+
+        X, y_cancel, _ = encode_categoricals(drop_leaky_features(df_full_with_rates))
+
+        # Re-apply target encoding to X (encode_categoricals re-runs label encoding)
+        for col in TARGET_ENCODED_COLS:
+            if col in X.columns and col in target_encode_maps:
+                rate_map = target_encode_maps[col]
+                # X[col] currently holds label-encoded integers; replace with target rates
+                original_col = df_full_with_rates[col] if col in df_full_with_rates.columns else None
+                if original_col is not None:
+                    X[col] = original_col.values
+                    X[col] = X[col].map(rate_map).fillna(global_cancel_mean).astype(float)
+
         feature_columns = list(X.columns)
 
         feature_defaults = {}
@@ -195,41 +281,117 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             else:
                 feature_defaults[col] = float(col_data.mode().iloc[0])
 
-        # Time-based 80/20 split (last 20% of sorted dates as test)
-        n_test = max(1, int(len(X) * 0.2))
+        # Use the same n_test split on the encoded matrix
         X_tr = X.iloc[:-n_test]
         y_tr = y_cancel.iloc[:-n_test]
         X_te = X.iloc[-n_test:]
+        y_te = y_cancel.iloc[-n_test:]
 
         spw = compute_scale_pos_weight(y_tr.values)
+
+        # Tune all three gradient boosting models with TimeSeriesSplit
+        log.info("Tuning XGBoost cancellation model...")
         best_xgb_params = tune_xgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
+        log.info("Tuning LightGBM cancellation model...")
+        best_lgb_params = tune_lgb_cancellation(X_tr.values, y_tr.values, scale_pos_weight=spw)
+
+        log.info("Tuning CatBoost cancellation model...")
+        best_cb_params = tune_catboost_cancellation(
+            X_tr.values, y_tr.values,
+            scale_pos_weight=spw,
+            cat_feature_indices=[],
+        )
+
         cancel_models = train_cancellation_models_balanced(
             X_tr.values,
             y_tr.values,
             scale_pos_weight=spw,
             xgb_params=best_xgb_params,
+            lgb_params=best_lgb_params,
+            catboost_params=best_cb_params,
+            feature_columns=feature_columns,
         )
+
+        # Build stacking meta-learner using out-of-fold predictions
+        log.info("Training stacking meta-learner...")
+        stacked_meta = train_stacked_cancellation_model(cancel_models, X_tr.values, y_tr.values)
+        cancel_models["stacked_meta"] = stacked_meta
 
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        shap_df = get_shap_feature_importance(
-            cancel_models["xgboost"],
-            X_te.values,
-            feature_columns,
-        )
-        selected_features = select_top_features(shap_df, threshold=0.01)
-        os.makedirs("outputs", exist_ok=True)
-        top_shap = shap_df.nlargest(15, "mean_abs_shap")
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.barh(top_shap["feature"], top_shap["mean_abs_shap"])
-        ax.set_xlabel("Mean |SHAP value|")
-        ax.set_title("Feature Importance (SHAP)")
-        ax.invert_yaxis()
-        plt.tight_layout()
-        plt.savefig("outputs/shap_summary.png", dpi=120, bbox_inches="tight")
-        plt.close()
+
+        # Use XGBoost (still best single-model for SHAP interpretation) for feature importance
+        try:
+            shap_df = get_shap_feature_importance(
+                cancel_models["xgboost"],
+                X_te.values,
+                feature_columns,
+            )
+            selected_features = select_top_features(shap_df, threshold=0.01)
+            os.makedirs("outputs", exist_ok=True)
+            top_shap = shap_df.nlargest(15, "mean_abs_shap")
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.barh(top_shap["feature"], top_shap["mean_abs_shap"])
+            ax.set_xlabel("Mean |SHAP value|")
+            ax.set_title("Feature Importance (SHAP)")
+            ax.invert_yaxis()
+            plt.tight_layout()
+            plt.savefig("outputs/shap_summary.png", dpi=120, bbox_inches="tight")
+            plt.close()
+        except Exception as exc:
+            log.warning("SHAP feature importance failed: %s", exc)
+            selected_features = feature_columns
+
+        # Calibrate stacked model probabilities on holdout
+        try:
+            from sklearn.calibration import CalibratedClassifierCV
+            # Wrap stacked predict_proba as a sklearn-compatible estimator for calibration
+            stacked_proba_te = predict_stacked_proba(stacked_meta, cancel_models, X_te.values)
+            # Find optimal threshold on holdout before calibration
+            optimal_threshold, optimal_acc = find_optimal_threshold(y_te.values, stacked_proba_te)
+            cancel_models["optimal_threshold"] = optimal_threshold
+            log.info(
+                "Stacked model — optimal threshold: %.2f, holdout accuracy: %.3f",
+                optimal_threshold, optimal_acc,
+            )
+        except Exception as exc:
+            log.warning("Threshold optimisation failed: %s", exc)
+            cancel_models["optimal_threshold"] = 0.5
+
+        # Print per-model metrics on holdout
+        log.info("Cancellation model holdout metrics:")
+        for name, model in cancel_models.items():
+            if name in ("stacked_meta", "optimal_threshold"):
+                continue
+            try:
+                proba = model.predict_proba(X_te.values)[:, 1]
+                thresh = float(cancel_models.get("optimal_threshold", 0.5))
+                preds = (proba >= thresh).astype(int)
+                from sklearn.metrics import accuracy_score as _acc, roc_auc_score as _auc
+                log.info(
+                    "  %-15s  Acc(thr=%.2f)=%.3f  ROC-AUC=%.3f",
+                    name, thresh, _acc(y_te.values, preds), _auc(y_te.values, proba),
+                )
+            except Exception:
+                pass
+        try:
+            stacked_proba_te = predict_stacked_proba(stacked_meta, cancel_models, X_te.values)
+            thresh = float(cancel_models.get("optimal_threshold", 0.5))
+            stacked_preds = (stacked_proba_te >= thresh).astype(int)
+            from sklearn.metrics import accuracy_score as _acc, roc_auc_score as _auc
+            log.info(
+                "  %-15s  Acc(thr=%.2f)=%.3f  ROC-AUC=%.3f",
+                "stacked", thresh,
+                _acc(y_te.values, stacked_preds),
+                _auc(y_te.values, stacked_proba_te),
+            )
+        except Exception as exc:
+            log.warning("Stacked model eval failed: %s", exc)
+
+        # Store target encoding maps alongside label encoders for inference
+        cancel_models["target_encode_maps"] = target_encode_maps
+        cancel_models["global_cancel_mean"] = global_cancel_mean
 
         results["cancel_models"] = cancel_models
         results["feature_columns"] = feature_columns
@@ -272,8 +434,23 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
 
         dem_eval_train = dem_series.iloc[:-test_days]
         dem_eval_test = dem_series.iloc[-test_days:]
-        dem_eval_xgb_m, dem_eval_xgb_c = train_xgb_forecaster(dem_eval_train, lags=FORECAST_LAGS)
-        dem_xgb_preds = forecast_xgb(dem_eval_xgb_m, dem_eval_xgb_c, dem_eval_train, test_days)
+        # Train with cancel rate + trends + OTB; forecast with future values of
+        # forward-looking signals (trends + OTB — historical values for the test
+        # window, which is what would be available at real forecast time).
+        dem_extra_train = demand_extra.iloc[:-test_days]
+        dem_eval_xgb_m, dem_eval_xgb_c = train_xgb_forecaster(
+            dem_eval_train, lags=FORECAST_LAGS, extra_features=dem_extra_train
+        )
+        future_features_dem = pd.concat([
+            _trends_feat.reindex(dem_eval_test.index),
+            _otb_feat.reindex(dem_eval_test.index, fill_value=0),
+            _otb_stly.reindex(dem_eval_test.index, fill_value=0),
+            _pace_feat.reindex(dem_eval_test.index, fill_value=0),
+        ], axis=1)
+        dem_xgb_preds = forecast_xgb(
+            dem_eval_xgb_m, dem_eval_xgb_c, dem_eval_train, test_days,
+            future_features=future_features_dem,
+        )
         dem_xgb_preds.index = dem_eval_test.index
         dem_naive = naive_baseline_forecast(dem_eval_train, test_days)
         dem_naive.index = dem_eval_test.index
@@ -291,8 +468,42 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
                 f"Holdout: last {test_days} days (unseen during training). "
                 "Production models are retrained on the full dataset for live forecasts."
             ),
+            # Rolling CV stability across 4 folds
             "cv_scores": ts_cross_val_scores(rev_series, n_splits=4, forecast_horizon=30),
+            "cv_demand": ts_cross_val_scores(dem_series, n_splits=4, forecast_horizon=30),
+            # Per-weekday and per-month MAPE breakdowns
+            "demand_xgb_breakdown": forecast_error_breakdown(
+                dem_eval_test.values, dem_xgb_preds.values, dem_eval_test.index
+            ),
+            "revenue_xgb_breakdown": forecast_error_breakdown(
+                rev_eval_test.values, rev_xgb_preds.values, rev_eval_test.index
+            ),
         }
+
+        # Per-hotel-type MAPE (fixes Validation page placeholders)
+        try:
+            hotel_daily = aggregate_daily_by_hotel_type(df)
+            for hotel_key, h_daily in hotel_daily.items():
+                h_key = hotel_key.lower().replace(" ", "_")
+                for series_col, metric_prefix in [
+                    ("daily_bookings", f"demand_xgb_{h_key}"),
+                    ("daily_booked_revenue", f"revenue_booked_xgb_{h_key}"),
+                    ("daily_realized_revenue", f"revenue_realized_xgb_{h_key}"),
+                ]:
+                    if series_col not in h_daily.columns or len(h_daily) < test_days + 30:
+                        continue
+                    h_series = h_daily[series_col]
+                    h_train = h_series.iloc[:-test_days]
+                    h_test = h_series.iloc[-test_days:]
+                    try:
+                        h_m, h_c = train_xgb_forecaster(h_train, lags=FORECAST_LAGS)
+                        h_preds = forecast_xgb(h_m, h_c, h_train, test_days)
+                        h_preds.index = h_test.index
+                        eval_metrics[metric_prefix] = regression_metrics(h_test.values, h_preds.values)
+                    except Exception as exc:
+                        log.warning("Per-hotel eval failed for %s/%s: %s", hotel_key, series_col, exc)
+        except Exception as exc:
+            log.warning("Per-hotel-type evaluation failed: %s", exc)
 
         try:
             second_df = load_cancellation_prediction_csv("cancellation_Prediction.csv")
