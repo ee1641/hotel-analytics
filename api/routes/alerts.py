@@ -18,7 +18,7 @@ def get_alerts(hotel_id: str, authenticated_hotel_id: str = Depends(verify_api_k
         models = get_or_train_models(dataset_context=context)
         xgb_model, feat_cols = models["xgb_demand"]
         forecast = forecast_xgb(xgb_model, feat_cols, daily_df["daily_bookings"], periods=30)
-        alerts = generate_daily_alerts(df, forecast, models["cancel_models"]["xgboost"], {})
+        alerts = generate_daily_alerts(df, forecast, models["cancel_models"], {})
         from dataclasses import asdict
         return {"status": "ok", "data": [asdict(a) for a in alerts]}
     except FileNotFoundError as e:

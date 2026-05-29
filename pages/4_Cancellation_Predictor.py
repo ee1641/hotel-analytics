@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app import get_or_train_models
 from src.cancellation import (
+    apply_probability_calibrator,
     get_survival_curve,
     predict_booking_survival_profile,
     predict_cancellation_proba,
+    predict_stacked_proba,
 )
 
 st.set_page_config(page_title="Cancellation Predictor", page_icon="🔮", layout="wide")
@@ -99,7 +101,13 @@ with st.form("cancellation_form"):
                 form_values[feat] = st.selectbox(label, **kwargs, key=feat)
 
     st.subheader("Select Classifier")
-    model_name = st.selectbox("Model", ["xgboost", "random_forest", "logistic"])
+    _model_options = ["stacked"] if "stacked_meta" in cancel_models else []
+    _model_options += ["xgboost", "random_forest", "logistic"]
+    model_name = st.selectbox(
+        "Model",
+        _model_options,
+        help="`stacked` blends all base models and applies isotonic calibration.",
+    )
     submitted = st.form_submit_button("Predict Cancellation Risk", type="primary")
 
 if submitted:
@@ -115,8 +123,16 @@ if submitted:
     row.update(overrides)
     input_vec = np.array([[row.get(col, 0.0) for col in feature_columns]], dtype=float)
 
-    selected_model = cancel_models[model_name]
-    prob = float(predict_cancellation_proba(selected_model, input_vec)[0])
+    if model_name == "stacked":
+        prob = float(predict_stacked_proba(
+            cancel_models["stacked_meta"],
+            cancel_models,
+            input_vec,
+            calibrator=cancel_models.get("probability_calibrator"),
+        )[0])
+    else:
+        selected_model = cancel_models[model_name]
+        prob = float(predict_cancellation_proba(selected_model, input_vec)[0])
 
     if prob < 0.35:
         risk, color, emoji = "Low", "green", "✅"

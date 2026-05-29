@@ -55,6 +55,9 @@ def test_assigned_room_type_not_in_X(engineered_df):
 
 
 def test_booking_changes_not_in_X(engineered_df):
+    # booking_changes is the terminal amendment count at check-in/cancellation,
+    # not a snapshot available at any earlier prediction time — using it leaks
+    # post-decision information into training.
     X, _, _ = encode_categoricals(drop_leaky_features(engineered_df))
     assert "booking_changes" not in X.columns
 

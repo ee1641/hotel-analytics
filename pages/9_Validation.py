@@ -17,9 +17,13 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src import model_cache
-from src.cancellation import predict_cancellation_proba
+from src.cancellation import (
+    apply_probability_calibrator,
+    predict_cancellation_proba,
+    predict_stacked_proba,
+)
 from src.cancellation_evaluation import _align_to_feature_columns
-from src.evaluation import classification_report_dict
+from src.evaluation import calibration_metrics, classification_report_dict
 from src.ingestion import normalize_uploaded_dataframe
 from src.preprocessing import (
     add_temporal_features,
@@ -63,6 +67,30 @@ if _eval_metrics:
             "City Hotel": _fmt(_city_key),
         })
     st.dataframe(pd.DataFrame(_rows), width='stretch', hide_index=True)
+
+    # Conformal interval coverage — how often the predicted band actually
+    # contains the truth on the same 30-day holdout. The nominal target is
+    # 1 - alpha (default 90%).
+    _coverage_rows = []
+    for _series_label, _key in [("Booked Revenue", "revenue_conformal_coverage"),
+                                 ("Demand",         "demand_conformal_coverage")]:
+        _block = _eval_metrics.get(_key) or {}
+        if not _block:
+            continue
+        _coverage_rows.append({
+            "Series": _series_label,
+            "Nominal":   f"{_block.get('nominal_coverage', float('nan')):.0%}",
+            "Empirical": f"{_block.get('coverage', float('nan')):.0%}",
+            "Mean Width": f"{_block.get('mean_width', float('nan')):,.1f}",
+            "N":         int(_block.get("n", 0)),
+        })
+    if _coverage_rows:
+        st.subheader("Forecast Interval Coverage")
+        st.caption(
+            "Split-conformal intervals on the 30-day holdout. Empirical coverage should sit "
+            "near the nominal target (90% by default); a gap signals miscalibration."
+        )
+        st.dataframe(pd.DataFrame(_coverage_rows), width='stretch', hide_index=True)
     st.divider()
 
 st.caption(
@@ -179,8 +207,13 @@ if defaulted:
 X = _align_to_feature_columns(df_for_features, feature_columns, label_encoders, feature_defaults)
 y_true = df["is_canceled"].values
 
+# Only iterate fitted base models — skip meta-learners, calibrators, encoding maps.
+from src.cancellation import _NON_MODEL_KEYS
+
 model_results = {}
 for name, model in cancel_models.items():
+    if name in _NON_MODEL_KEYS:
+        continue
     try:
         prob = predict_cancellation_proba(model, X)
         pred = (prob >= 0.5).astype(int)
@@ -197,6 +230,31 @@ for name, model in cancel_models.items():
         model_results[name] = {"prob": prob, "pred": pred, "metrics": metrics}
     except Exception as exc:
         model_results[name] = {"error": str(exc)}
+
+# Add the stacked + calibrated path explicitly so the reliability panel can compare it.
+if "stacked_meta" in cancel_models:
+    try:
+        stacked_prob = predict_stacked_proba(
+            cancel_models["stacked_meta"],
+            cancel_models,
+            X,
+            calibrator=cancel_models.get("probability_calibrator"),
+        )
+        thresh = float(cancel_models.get("optimal_threshold", 0.5))
+        stacked_pred = (stacked_prob >= thresh).astype(int)
+        try:
+            stacked_metrics = classification_report_dict(y_true, stacked_pred, stacked_prob)
+        except Exception:
+            stacked_metrics = {
+                "accuracy": float(np.mean(stacked_pred == y_true)),
+                "precision": 0.0, "recall": 0.0, "f1": 0.0,
+                "roc_auc": float("nan"),
+            }
+        model_results["stacked_calibrated"] = {
+            "prob": stacked_prob, "pred": stacked_pred, "metrics": stacked_metrics,
+        }
+    except Exception as exc:
+        model_results["stacked_calibrated"] = {"error": str(exc)}
 
 n_total = len(y_true)
 n_canceled = int(y_true.sum())
@@ -216,7 +274,11 @@ st.divider()
 st.subheader("Model Performance")
 
 MODEL_DISPLAY = {
-    "xgboost": ("XGBoost", True),
+    "stacked_calibrated": ("Stacked (Calibrated)", True),
+    "xgboost": ("XGBoost", False),
+    "lightgbm": ("LightGBM", False),
+    "catboost": ("CatBoost", False),
+    "xgboost_dart": ("XGBoost DART", False),
     "random_forest": ("Random Forest", False),
     "logistic": ("Logistic Regression", False),
 }
@@ -316,6 +378,85 @@ if "error" not in xgb_res and xgb_res:
             margin=dict(t=40, b=20, l=20, r=20),
         )
         st.plotly_chart(dist_fig, width='stretch')
+
+# ---------------------------------------------------------------------------
+# Section 7b — Calibration / Reliability
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Probability Calibration")
+st.caption(
+    "Brier and ECE measure how well predicted probabilities match observed frequencies. "
+    "The reliability curve plots each model's mean predicted prob (by bin) against the "
+    "empirical positive rate; a perfectly calibrated model traces the dashed diagonal."
+)
+
+_calibration_rows = []
+_curve_traces = []
+_curve_palette = {
+    "stacked_calibrated": "#0b5394",
+    "xgboost":            "#cc4125",
+    "lightgbm":           "#674ea7",
+    "catboost":           "#e69138",
+    "random_forest":      "#38761d",
+    "logistic":           "#6c757d",
+    "xgboost_dart":       "#a64d79",
+}
+for _name, _res in model_results.items():
+    if "error" in _res or _name not in MODEL_DISPLAY:
+        continue
+    _display, _ = MODEL_DISPLAY[_name]
+    _calres = calibration_metrics(y_true, _res["prob"], n_bins=10)
+    _calibration_rows.append({
+        "Model":  _display,
+        "Brier":  round(_calres["brier"], 4),
+        "ECE":    round(_calres["ece"], 4),
+        "ROC-AUC": round(_res["metrics"].get("roc_auc", float("nan")), 3),
+    })
+    _curve = _calres["curve"].dropna(subset=["mean_pred", "empirical_pos_rate"])
+    if not _curve.empty:
+        _curve_traces.append(
+            go.Scatter(
+                x=_curve["mean_pred"],
+                y=_curve["empirical_pos_rate"],
+                mode="lines+markers",
+                name=_display,
+                line=dict(color=_curve_palette.get(_name, "#444"), width=2),
+                marker=dict(size=7),
+            )
+        )
+
+if _calibration_rows:
+    cal_col1, cal_col2 = st.columns([1, 2])
+    with cal_col1:
+        st.markdown("**Calibration Metrics**")
+        st.dataframe(
+            pd.DataFrame(_calibration_rows).sort_values("ECE"),
+            width='stretch', hide_index=True,
+        )
+        st.caption("Lower Brier and ECE are better. ROC-AUC is rank-based and unaffected by calibration.")
+    with cal_col2:
+        st.markdown("**Reliability Curve**")
+        cal_fig = go.Figure()
+        cal_fig.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line=dict(color="gray", dash="dash", width=1),
+            name="Perfect calibration",
+            hoverinfo="skip",
+        ))
+        for _trace in _curve_traces:
+            cal_fig.add_trace(_trace)
+        cal_fig.update_layout(
+            xaxis_title="Mean predicted probability (per bin)",
+            yaxis_title="Empirical positive rate",
+            xaxis=dict(range=[0, 1]),
+            yaxis=dict(range=[0, 1]),
+            height=420,
+            legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="left", x=0),
+            margin=dict(t=30, b=30, l=20, r=20),
+        )
+        st.plotly_chart(cal_fig, width='stretch')
+else:
+    st.info("Reliability metrics unavailable — no model produced valid probabilities.")
 
 # ---------------------------------------------------------------------------
 # Section 8 — Row-level table

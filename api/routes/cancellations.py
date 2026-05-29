@@ -35,7 +35,7 @@ def predict_cancellation(
     try:
         import pandas as pd
         from src.services import get_or_train_models
-        from src.cancellation import predict_booking_survival_profile
+        from src.cancellation import predict_booking_survival_profile, predict_stacked_proba
         from src.cancellation_evaluation import _align_to_feature_columns
         context = resolve_hotel_dataset_context(hotel_id)
         models = get_or_train_models(dataset_context=context)
@@ -46,8 +46,16 @@ def predict_cancellation(
             models["label_encoders"],
             models["feature_defaults"],
         )
-        model = models["cancel_models"]["xgboost"]
-        proba = float(model.predict_proba(X)[0][1])
+        cancel_models = models["cancel_models"]
+        if "stacked_meta" in cancel_models:
+            proba = float(predict_stacked_proba(
+                cancel_models["stacked_meta"],
+                cancel_models,
+                X,
+                calibrator=cancel_models.get("probability_calibrator"),
+            )[0])
+        else:
+            proba = float(cancel_models["xgboost"].predict_proba(X)[0][1])
         risk = "High" if proba > 0.6 else ("Medium" if proba > 0.3 else "Low")
         payload = {"cancel_probability": round(proba, 4), "risk_tier": risk}
 

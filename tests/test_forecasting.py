@@ -249,10 +249,11 @@ def test_log_target_direct_positive(daily_series):
 # ---------------------------------------------------------------------------
 
 def test_interaction_features_present(daily_series):
-    """make_lag_features includes all 6 interaction columns."""
+    """make_lag_features includes the weekday×seasonality interaction columns."""
     df = make_lag_features(daily_series, lags=[1, 7])
-    for col in ["season", "dow_sin_x_month", "dow_cos_x_month",
-                "is_weekend_x_holiday", "school_x_weekend", "season_x_is_weekend"]:
+    for col in ["season", "is_weekend_x_holiday", "school_x_weekend",
+                "season_x_is_weekend", "weekend_x_summer", "holiday_x_season",
+                "lag_7_x_weekend"]:
         assert col in df.columns, f"Missing interaction column: {col}"
 
 

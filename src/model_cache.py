@@ -15,6 +15,8 @@ MODELS_DIR = Path("models")
 _PATHS: dict[str, str] = {
     "xgb_revenue":      "xgb_revenue_forecaster.pkl",
     "xgb_revenue_intervals": "xgb_revenue_interval_forecasters.pkl",
+    "xgb_revenue_conformal": "xgb_revenue_conformal.pkl",
+    "xgb_demand_conformal":  "xgb_demand_conformal.pkl",
     "xgb_realized_revenue": "xgb_realized_revenue_forecaster.pkl",
     "xgb_realized_revenue_intervals": "xgb_realized_revenue_interval_forecasters.pkl",
     "xgb_expected_revenue": "xgb_expected_revenue_forecaster.pkl",

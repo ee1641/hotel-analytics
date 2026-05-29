@@ -17,12 +17,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app import get_or_train_models, load_and_prepare_data
 from src.config import APP_CONFIG
+from src.conformal import forecast_conformal
 from src.forecasting import (
     blend_forecasts,
     forecast_prophet,
     forecast_xgb,
     forecast_xgb_direct,
     forecast_xgb_with_intervals,
+    generate_oof_predictions,
     naive_baseline_forecast,
 )
 from src.revenue_management import (
@@ -245,7 +247,6 @@ if _has_tuning_data:
 st.divider()
 
 st.subheader(forecast_title)
-history_window = series.iloc[-90:]
 show_ci = False
 band_df = None
 
@@ -285,19 +286,34 @@ except Exception as _we:
 if model_choice == "XGBoost":
     direct_models = models.get(direct_key)
     interval_models = models.get(interval_key)
+    # Conformal bundle exists only for the combined (non-segmented) booked revenue
+    # and demand series — for per-hotel views we fall back to quantile intervals.
+    _conformal_key = None
+    if not _slug_suffix:
+        if series_choice == "Revenue" and revenue_type == "Booked Revenue":
+            _conformal_key = "xgb_revenue_conformal"
+        elif series_choice == "Demand":
+            _conformal_key = "xgb_demand_conformal"
+    conformal_bundle = models.get(_conformal_key) if _conformal_key else None
+
+    def _build_band(_series_for_band):
+        if conformal_bundle is not None:
+            return forecast_conformal(conformal_bundle, _series_for_band, periods=30,
+                                       future_features=_future_otb)
+        return forecast_xgb_with_intervals(interval_models, _series_for_band, periods=30,
+                                            future_features=_future_otb)
+
     if direct_models:
         # Direct multi-step: each horizon uses actual historical values, no error accumulation
         forecast_30 = forecast_xgb_direct(
             direct_models, series, holiday_country=APP_CONFIG.get("holiday_country")
         )
-        if interval_models:
-            band_df = forecast_xgb_with_intervals(interval_models, series, periods=30,
-                                                  future_features=_future_otb)
+        if conformal_bundle is not None or interval_models:
+            band_df = _build_band(series)
             band_df["ds"] = pd.to_datetime(band_df["ds"])
             show_ci = True
-    elif interval_models:
-        band_df = forecast_xgb_with_intervals(interval_models, series, periods=30,
-                                              future_features=_future_otb)
+    elif conformal_bundle is not None or interval_models:
+        band_df = _build_band(series)
         band_df["ds"] = pd.to_datetime(band_df["ds"])
         forecast_30 = band_df.set_index("ds")["yhat"].rename("forecast")
         show_ci = True
@@ -314,14 +330,109 @@ else:
 
 baseline_30 = naive_baseline_forecast(series, periods=30)
 
+# --- Backtest: use stored eval predictions from training (same 20% holdout) ---
+# We pull the saved backtest series from eval_metrics rather than re-running
+# the model on a truncated series, which would produce wrong lag features.
+_backtest_preds = None
+_backtest_test = None
+_BACKTEST_DAYS = 30
+
+_bt_pred_key = {
+    "XGBoost": xgb_metric_key + "_preds",
+    "Prophet": prophet_metric_key + "_preds",
+    "Naive Baseline": naive_key + "_preds",
+}[model_choice]
+_bt_actual_key = xgb_metric_key + "_actuals"
+
+_stored_preds   = eval_metrics.get(_bt_pred_key)
+_stored_actuals = eval_metrics.get(_bt_actual_key)
+
+# Only use cached eval arrays for the combined view. Per-hotel views
+# (Resort/City) must fall through to the fallback below — the cached arrays
+# were computed on the combined dataset and would overlay summed values
+# on a per-hotel chart.
+if not _slug_suffix and _stored_preds is not None and _stored_actuals is not None:
+    _backtest_preds = pd.Series(_stored_preds, name="forecast")
+    _backtest_test  = pd.Series(_stored_actuals, name="actual")
+    # Align both to the tail of the historical series for display
+    _bt_test_index = series.iloc[-len(_stored_actuals):].index
+    _backtest_preds.index = _bt_test_index
+    _backtest_test.index  = _bt_test_index
+elif len(series) > _BACKTEST_DAYS:
+    # Fallback: re-run on last 30 days using the non-direct model to avoid lag issues
+    _bt_train = series.iloc[:-_BACKTEST_DAYS]
+    _bt_test  = series.iloc[-_BACKTEST_DAYS:]
+    try:
+        if model_choice == "XGBoost":
+            _backtest_preds = forecast_xgb(xgb_model, feat_cols, _bt_train, periods=_BACKTEST_DAYS)
+            _backtest_preds.index = _bt_test.index
+        elif model_choice == "Prophet":
+            _bt_prophet_df = forecast_prophet(prophet_model, periods=_BACKTEST_DAYS)
+            _bt_prophet_df["ds"] = pd.to_datetime(_bt_prophet_df["ds"])
+            _backtest_preds = _bt_prophet_df.set_index("ds")["yhat"].rename("forecast")
+            _backtest_preds.index = _bt_test.index
+        else:
+            _backtest_preds = naive_baseline_forecast(_bt_train, periods=_BACKTEST_DAYS)
+            _backtest_preds.index = _bt_test.index
+        _backtest_test = _bt_test
+    except Exception:
+        _backtest_preds = None
+
 fig = go.Figure()
+
+# Historical line (pre-backtest window) — full series
+_history_no_test = series.iloc[:-_BACKTEST_DAYS]
+
 fig.add_trace(
     go.Scatter(
-        x=history_window.index,
-        y=history_window.values,
+        x=_history_no_test.index,
+        y=_history_no_test.values,
         name="Historical",
         line=dict(color="steelblue", width=2),
     )
+)
+
+# Backtest period: actual values in a bright color so they stand out from predictions
+if _backtest_test is not None:
+    fig.add_trace(
+        go.Scatter(
+            x=_backtest_test.index,
+            y=_backtest_test.values,
+            name="Actual (backtest period)",
+            line=dict(color="#00BFFF", width=2.5),
+        )
+    )
+else:
+    # Fallback: draw last 30 days of the series
+    _history_test_window = series.iloc[-_BACKTEST_DAYS:]
+    fig.add_trace(
+        go.Scatter(
+            x=_history_test_window.index,
+            y=_history_test_window.values,
+            name="Actual (backtest period)",
+            line=dict(color="#00BFFF", width=2.5),
+        )
+    )
+
+# Model predictions overlaid on actuals — users can see accuracy directly
+if _backtest_preds is not None:
+    fig.add_trace(
+        go.Scatter(
+            x=_backtest_preds.index,
+            y=_backtest_preds.values,
+            name=f"{model_choice} (backtest fit)",
+            line=dict(color="darkorange", width=2, dash="dot"),
+        )
+    )
+
+# Vertical separator line between known history and future forecast
+_split_date = series.index[-1]
+fig.add_vline(
+    x=_split_date.timestamp() * 1000,
+    line_dash="dash",
+    line_color="rgba(100,100,100,0.4)",
+    annotation_text="Forecast starts",
+    annotation_position="top left",
 )
 
 if show_ci and band_df is not None:
@@ -341,7 +452,7 @@ fig.add_trace(
     go.Scatter(
         x=forecast_30.index,
         y=forecast_30.values,
-        name=f"{model_choice} Forecast",
+        name=f"{model_choice} Forecast (future)",
         line=dict(color="tomato", width=2, dash="dash"),
     )
 )
@@ -358,9 +469,49 @@ fig.update_layout(
     xaxis_title="Date",
     yaxis_title=y_label,
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    height=430,
+    height=450,
 )
 st.plotly_chart(fig, width='stretch')
+
+st.divider()
+st.subheader("Actual vs Predicted — Full History (Cross-Validation)")
+st.caption(
+    "Expanding-window cross-validation across 5 folds. Each fold trains on earlier data "
+    "and predicts a future window it never saw — so every point here is a genuine out-of-sample prediction."
+)
+
+@st.cache_data(show_spinner="Running cross-validation… (runs once, then cached)")
+def _run_oof(series_values, series_index):
+    # Args are NOT underscore-prefixed: Streamlit hashes them so toggling
+    # series (Revenue/Demand, hotel type, revenue type) correctly invalidates
+    # the cache. The OOF result does not depend on model_choice — the helper
+    # trains XGBoost + Prophet + SARIMA regardless — so it is not a cache key.
+    s = pd.Series(series_values, index=series_index)
+    return generate_oof_predictions(s, n_splits=5)
+
+oof_df = _run_oof(series.values, series.index)
+
+oof_fig = go.Figure()
+oof_fig.add_trace(go.Scatter(
+    x=oof_df.index, y=oof_df["actual"],
+    name="Actual", line=dict(color="#00BFFF", width=2),
+))
+oof_fig.add_trace(go.Scatter(
+    x=oof_df.index, y=oof_df["xgb"],
+    name="XGBoost (OOF)", line=dict(color="darkorange", width=1.5, dash="dot"),
+))
+oof_fig.add_trace(go.Scatter(
+    x=oof_df.index, y=oof_df["prophet"],
+    name="Prophet (OOF)", line=dict(color="mediumseagreen", width=1.5, dash="dash"),
+))
+oof_fig.update_layout(
+    hovermode="x unified",
+    xaxis_title="Date",
+    yaxis_title=y_label,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    height=500,
+)
+st.plotly_chart(oof_fig, width='stretch')
 
 with st.expander("View 30-Day Forecast Data"):
     forecast_df = pd.DataFrame(
@@ -441,13 +592,17 @@ def _pricing_models(dataframe: pd.DataFrame):
 
 
 elasticity_models = _pricing_models(df)
+demand_conformal = models.get("xgb_demand_conformal")
 demand_bands = models.get("xgb_demand_intervals")
 # Slice the bookings history to the snapshot date so the pricing forecast
 # covers the same window as the pickup report (snapshot+1 … snapshot+30).
 bookings_to_snapshot = daily_df["daily_bookings"].loc[: snapshot_date]
 if len(bookings_to_snapshot) < 2:
     bookings_to_snapshot = daily_df["daily_bookings"]
-if demand_bands:
+if demand_conformal is not None:
+    demand_forecast_df = forecast_conformal(demand_conformal, bookings_to_snapshot, periods=30,
+                                             future_features=_future_otb)
+elif demand_bands:
     demand_forecast_df = forecast_xgb_with_intervals(demand_bands, bookings_to_snapshot, periods=30,
                                                      future_features=_future_otb)
 else:

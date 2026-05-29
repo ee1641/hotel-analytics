@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 import pandas as pd
 from api.auth import verify_api_key, check_hotel_ownership
+from src.conformal import forecast_conformal
 from src.data_context import resolve_hotel_dataset_context
 
 router = APIRouter(prefix="/hotels/{hotel_id}/forecasts", tags=["forecasts"])
@@ -24,10 +25,18 @@ def get_forecast(
         models = get_or_train_models(dataset_context=context)
         key = "xgb_revenue" if type == "revenue" else "xgb_demand"
         interval_key = "xgb_revenue_intervals" if type == "revenue" else "xgb_demand_intervals"
+        conformal_key = "xgb_revenue_conformal" if type == "revenue" else "xgb_demand_conformal"
         series_key = "daily_revenue" if type == "revenue" else "daily_bookings"
 
-        if include_intervals and interval_key in models:
-            forecast_df = forecast_xgb_with_intervals(models[interval_key], daily_df[series_key], periods=horizon)
+        if include_intervals and (conformal_key in models or interval_key in models):
+            if conformal_key in models and models[conformal_key] is not None:
+                forecast_df = forecast_conformal(
+                    models[conformal_key], daily_df[series_key], periods=horizon,
+                )
+            else:
+                forecast_df = forecast_xgb_with_intervals(
+                    models[interval_key], daily_df[series_key], periods=horizon,
+                )
             forecast_payload = [
                 {
                     "date": str(pd.Timestamp(row.ds).date()),

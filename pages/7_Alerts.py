@@ -50,7 +50,7 @@ config = {
 # ---------------------------------------------------------------------------
 # Generate alerts
 # ---------------------------------------------------------------------------
-cancel_model = models["cancel_models"]["xgboost"]
+cancel_model = models["cancel_models"]
 xgb_model, feat_cols = models["xgb_demand"]
 demand_forecast = forecast_xgb(xgb_model, feat_cols, daily_df["daily_bookings"], periods=30)
 

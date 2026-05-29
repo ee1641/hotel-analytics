@@ -15,6 +15,7 @@ from sklearn.preprocessing import LabelEncoder
 from src import model_cache
 from src.cancellation import (
     TARGET_ENCODED_COLS,
+    apply_probability_calibrator,
     compute_scale_pos_weight,
     find_optimal_threshold,
     get_shap_feature_importance,
@@ -22,6 +23,7 @@ from src.cancellation import (
     select_top_features,
     train_cancellation_models_balanced,
     train_cancellation_survival_model,
+    train_probability_calibrator,
     train_stacked_cancellation_model,
     tune_catboost_cancellation,
     tune_lgb_cancellation,
@@ -29,7 +31,12 @@ from src.cancellation import (
 )
 from src.cancellation_evaluation import evaluate_cross_dataset
 from src.config import APP_CONFIG
-from src.evaluation import forecast_error_breakdown, regression_metrics, ts_cross_val_scores
+from src.evaluation import (
+    empirical_interval_coverage,
+    forecast_error_breakdown,
+    regression_metrics,
+    ts_cross_val_scores,
+)
 from src.forecasting import (
     forecast_prophet,
     forecast_xgb,
@@ -40,16 +47,19 @@ from src.forecasting import (
     train_xgb_forecaster,
     train_xgb_forecaster_with_intervals,
 )
+from src.conformal import forecast_conformal, split_conformal_calibrate
 from src.ingestion import load_cancellation_prediction_csv
 from src.trends import build_trends_features, TRENDS_FEATURE_COLS
 from src.revenue_management import build_otb_feature_matrix
 from src.model_specs import (
     CANCELLATION_MODEL_VERSION,
+    CONFORMAL_INTERVAL_VERSION,
     DIRECT_FORECAST_MODEL_VERSION,
     EVAL_METRICS_VERSION,
     FORECAST_LAGS,
     FORECAST_MODEL_VERSION,
     INTERVAL_MODEL_VERSION,
+    MIN_FORECAST_HISTORY,
     PROPHET_MODEL_VERSION,
     SURVIVAL_MODEL_VERSION,
 )
@@ -152,6 +162,13 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
 
     # ------------------------------------------------------------------
     # Revenue forecasting
+    #
+    # NOTE: extras like adr_lag1, OTB-STLY, and pace ratios were previously
+    # passed via extra_features here, but no inference caller (the FastAPI
+    # route nor the Streamlit fallback) supplies future_features for them.
+    # That created a train/serve skew where every horizon row defaulted those
+    # columns to 0.0 at inference. Train without extras until a future_features
+    # supplier exists at every call site.
     # ------------------------------------------------------------------
     if _artifact_current("xgb_revenue", FORECAST_MODEL_VERSION, models_dir):
         results["xgb_revenue"] = model_cache.load_artifact("xgb_revenue", models_dir=models_dir)
@@ -173,6 +190,15 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         interval_models = train_xgb_forecaster_with_intervals(rev_series, lags=FORECAST_LAGS)
         results["xgb_revenue_intervals"] = interval_models
         _save_versioned("xgb_revenue_intervals", interval_models, INTERVAL_MODEL_VERSION, models_dir)
+
+    if _artifact_current("xgb_revenue_conformal", CONFORMAL_INTERVAL_VERSION, models_dir):
+        results["xgb_revenue_conformal"] = model_cache.load_artifact("xgb_revenue_conformal", models_dir=models_dir)
+    else:
+        rev_conformal = split_conformal_calibrate(
+            rev_series, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+        )
+        results["xgb_revenue_conformal"] = rev_conformal
+        _save_versioned("xgb_revenue_conformal", rev_conformal, CONFORMAL_INTERVAL_VERSION, models_dir)
 
     if _artifact_current("prophet_revenue", PROPHET_MODEL_VERSION, models_dir):
         results["prophet_revenue"] = model_cache.load_artifact("prophet_revenue", models_dir=models_dir)
@@ -206,6 +232,20 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         interval_models = train_xgb_forecaster_with_intervals(dem_series, lags=FORECAST_LAGS)
         results["xgb_demand_intervals"] = interval_models
         _save_versioned("xgb_demand_intervals", interval_models, INTERVAL_MODEL_VERSION, models_dir)
+
+    if _artifact_current("xgb_demand_conformal", CONFORMAL_INTERVAL_VERSION, models_dir):
+        results["xgb_demand_conformal"] = model_cache.load_artifact("xgb_demand_conformal", models_dir=models_dir)
+    else:
+        # Demand model uses extra features (cancel rate lag, trends, OTB, pace).
+        # Calibrate with those so train and serve match — though the conformal
+        # holdout doesn't see future-only signals because the holdout period is
+        # past data with known feature values.
+        dem_conformal = split_conformal_calibrate(
+            dem_series, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+            extra_features=demand_extra,
+        )
+        results["xgb_demand_conformal"] = dem_conformal
+        _save_versioned("xgb_demand_conformal", dem_conformal, CONFORMAL_INTERVAL_VERSION, models_dir)
 
     if _artifact_current("prophet_demand", PROPHET_MODEL_VERSION, models_dir):
         results["prophet_demand"] = model_cache.load_artifact("prophet_demand", models_dir=models_dir)
@@ -317,6 +357,17 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         stacked_meta = train_stacked_cancellation_model(cancel_models, X_tr.values, y_tr.values)
         cancel_models["stacked_meta"] = stacked_meta
 
+        # Fit isotonic calibrator on OOF stacked predictions so downstream
+        # decisions (overbooking Poisson sum, alert thresholds) consume true
+        # frequencies rather than raw stacker scores.
+        log.info("Fitting probability calibrator on OOF stacked predictions...")
+        try:
+            calibrator = train_probability_calibrator(cancel_models, X_tr.values, y_tr.values)
+        except Exception as exc:
+            log.warning("Probability calibration failed, falling back to raw probs: %s", exc)
+            calibrator = None
+        cancel_models["probability_calibrator"] = calibrator
+
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -343,16 +394,17 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             log.warning("SHAP feature importance failed: %s", exc)
             selected_features = feature_columns
 
-        # Calibrate stacked model probabilities on holdout
+        # Find optimal threshold on calibrated probabilities — production callers
+        # consume calibrated probs, so the threshold must be optimised on the same.
         try:
-            from sklearn.calibration import CalibratedClassifierCV
-            # Wrap stacked predict_proba as a sklearn-compatible estimator for calibration
-            stacked_proba_te = predict_stacked_proba(stacked_meta, cancel_models, X_te.values)
-            # Find optimal threshold on holdout before calibration
+            stacked_proba_te = predict_stacked_proba(
+                stacked_meta, cancel_models, X_te.values,
+                calibrator=calibrator,
+            )
             optimal_threshold, optimal_acc = find_optimal_threshold(y_te.values, stacked_proba_te)
             cancel_models["optimal_threshold"] = optimal_threshold
             log.info(
-                "Stacked model — optimal threshold: %.2f, holdout accuracy: %.3f",
+                "Stacked model (calibrated) — optimal threshold: %.2f, holdout accuracy: %.3f",
                 optimal_threshold, optimal_acc,
             )
         except Exception as exc:
@@ -376,13 +428,16 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             except Exception:
                 pass
         try:
-            stacked_proba_te = predict_stacked_proba(stacked_meta, cancel_models, X_te.values)
+            stacked_proba_te = predict_stacked_proba(
+                stacked_meta, cancel_models, X_te.values,
+                calibrator=cancel_models.get("probability_calibrator"),
+            )
             thresh = float(cancel_models.get("optimal_threshold", 0.5))
             stacked_preds = (stacked_proba_te >= thresh).astype(int)
             from sklearn.metrics import accuracy_score as _acc, roc_auc_score as _auc
             log.info(
                 "  %-15s  Acc(thr=%.2f)=%.3f  ROC-AUC=%.3f",
-                "stacked", thresh,
+                "stacked_cal", thresh,
                 _acc(y_te.values, stacked_preds),
                 _auc(y_te.values, stacked_proba_te),
             )
@@ -479,6 +534,48 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
                 rev_eval_test.values, rev_xgb_preds.values, rev_eval_test.index
             ),
         }
+
+        # Empirical interval coverage on the same 30-day holdout: calibrate a
+        # conformal bundle on data up to the holdout, then evaluate band
+        # coverage on the held-out window. Captures the gap between the 90%
+        # nominal level and the actual rate of containment.
+        try:
+            rev_cal_bundle = split_conformal_calibrate(
+                rev_eval_train, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+            )
+            rev_band = forecast_conformal(rev_cal_bundle, rev_eval_train, periods=test_days)
+            eval_metrics["revenue_conformal_coverage"] = {
+                **empirical_interval_coverage(
+                    rev_eval_test.values,
+                    rev_band["yhat_lower"].values,
+                    rev_band["yhat_upper"].values,
+                ),
+                "alpha": float(rev_cal_bundle["alpha"]),
+                "nominal_coverage": 1.0 - float(rev_cal_bundle["alpha"]),
+            }
+        except Exception as exc:
+            log.warning("Revenue conformal coverage eval failed: %s", exc)
+
+        try:
+            dem_cal_bundle = split_conformal_calibrate(
+                dem_eval_train, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+                extra_features=dem_extra_train,
+            )
+            dem_band = forecast_conformal(
+                dem_cal_bundle, dem_eval_train, periods=test_days,
+                future_features=future_features_dem,
+            )
+            eval_metrics["demand_conformal_coverage"] = {
+                **empirical_interval_coverage(
+                    dem_eval_test.values,
+                    dem_band["yhat_lower"].values,
+                    dem_band["yhat_upper"].values,
+                ),
+                "alpha": float(dem_cal_bundle["alpha"]),
+                "nominal_coverage": 1.0 - float(dem_cal_bundle["alpha"]),
+            }
+        except Exception as exc:
+            log.warning("Demand conformal coverage eval failed: %s", exc)
 
         # Per-hotel-type MAPE (fixes Validation page placeholders)
         try:

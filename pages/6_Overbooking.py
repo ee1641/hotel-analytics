@@ -36,7 +36,7 @@ with st.spinner("Training models… this may take a few minutes on first run."):
         st.error(f"Failed to load data or models: {e}")
         st.stop()
 
-cancel_model = models["cancel_models"]["xgboost"]
+cancel_model = models["cancel_models"]
 feature_columns = models["feature_columns"]
 label_encoders = models["label_encoders"]
 feature_defaults = models["feature_defaults"]

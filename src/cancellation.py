@@ -22,6 +22,16 @@ from src.revenue_management import prepare_booking_timeline
 
 log = logging.getLogger(__name__)
 
+# Market segment risk tiers for segment-specific cancellation models
+SEGMENT_GROUPS = {
+    "high_risk":   ["Online TA", "Groups"],
+    "medium_risk": ["Offline TA/TO", "Direct", "Complementary", "Aviation"],
+    "low_risk":    ["Corporate"],
+}
+
+# Minimum training samples needed to fit a segment-specific model
+_MIN_SEGMENT_SAMPLES = 100
+
 # Categorical columns passed to CatBoost for native handling (label-encoded integers)
 CATBOOST_CAT_COLS = [
     "meal",
@@ -50,7 +60,7 @@ def train_cancellation_models(X_train, y_train) -> dict:
         "random_forest": RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
-            n_jobs=1,
+            n_jobs=-1,
             random_state=42,
         ),
         "xgboost": XGBClassifier(
@@ -82,7 +92,7 @@ def tune_xgb_cancellation(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
     scale_pos_weight: float,
-    n_iter: int = 10,
+    n_iter: int = 15,
     n_splits: int = 3,
 ) -> dict:
     """
@@ -113,7 +123,7 @@ def tune_xgb_cancellation(
         cv=TimeSeriesSplit(n_splits=n_splits),
         scoring="roc_auc",
         random_state=42,
-        n_jobs=1,
+        n_jobs=-1,
     )
     search.fit(X_tr, y_tr)
     return search.best_params_
@@ -123,8 +133,8 @@ def tune_lgb_cancellation(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
     scale_pos_weight: float,
-    n_iter: int = 20,
-    n_splits: int = 5,
+    n_iter: int = 15,
+    n_splits: int = 3,
 ) -> dict:
     """
     Run RandomizedSearchCV over LightGBM hyperparameters using TimeSeriesSplit.
@@ -149,7 +159,7 @@ def tune_lgb_cancellation(
     base = lgb.LGBMClassifier(
         scale_pos_weight=scale_pos_weight,
         random_state=42,
-        n_jobs=1,
+        n_jobs=-1,
         verbose=-1,
     )
     search = RandomizedSearchCV(
@@ -159,7 +169,7 @@ def tune_lgb_cancellation(
         cv=TimeSeriesSplit(n_splits=n_splits),
         scoring="roc_auc",
         random_state=42,
-        n_jobs=1,
+        n_jobs=-1,
     )
     search.fit(X_tr, y_tr)
     return search.best_params_
@@ -171,7 +181,7 @@ def tune_catboost_cancellation(
     scale_pos_weight: float,
     cat_feature_indices: list[int],
     n_iter: int = 15,
-    n_splits: int = 5,
+    n_splits: int = 3,
 ) -> dict:
     """
     Run RandomizedSearchCV over CatBoost hyperparameters using TimeSeriesSplit.
@@ -206,7 +216,7 @@ def tune_catboost_cancellation(
         cv=TimeSeriesSplit(n_splits=n_splits),
         scoring="roc_auc",
         random_state=42,
-        n_jobs=1,
+        n_jobs=-1,
     )
     search.fit(X_tr, y_tr)
     return search.best_params_
@@ -222,8 +232,8 @@ def train_cancellation_models_balanced(
     feature_columns: list[str] | None = None,
 ) -> dict:
     """
-    Train five balanced classifiers: logistic, random_forest, xgboost, lightgbm, catboost.
-    LightGBM and CatBoost are skipped gracefully if not installed.
+    Train six balanced classifiers: logistic, random_forest, xgboost, xgboost_dart,
+    lightgbm, catboost. LightGBM and CatBoost are skipped gracefully if not installed.
     Pass *_params dicts (from tune_* functions) to override defaults.
     feature_columns is required for CatBoost to identify categorical feature indices.
     """
@@ -238,7 +248,7 @@ def train_cancellation_models_balanced(
         "random_forest": RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
-            n_jobs=1,
+            n_jobs=-1,
             random_state=42,
             class_weight="balanced",
         ),
@@ -253,6 +263,20 @@ def train_cancellation_models_balanced(
                 "random_state": 42,
                 "scale_pos_weight": spw,
             }
+        ),
+        # DART booster: dropout regularisation on gradient boosting trees.
+        # Cannot use early stopping (n_estimators is fixed). Tuned separately via defaults.
+        "xgboost_dart": XGBClassifier(
+            n_estimators=400,
+            max_depth=6,
+            learning_rate=0.05,
+            booster="dart",
+            rate_drop=0.1,
+            skip_drop=0.5,
+            eval_metric="logloss",
+            verbosity=0,
+            random_state=42,
+            scale_pos_weight=spw,
         ),
     }
 
@@ -331,35 +355,110 @@ def train_stacked_cancellation_model(
     tscv = TimeSeriesSplit(n_splits=n_splits)
     model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
     oof = np.zeros((len(X_tr), len(model_names)))
+    # Init weights to zero so the leading prefix never placed in any val_idx
+    # (TimeSeriesSplit reserves the first ~1/(n_splits+1) of rows for training
+    # only) is excluded from the meta-learner fit. Otherwise those phantom
+    # all-zero OOF rows would be fit at maximum weight.
+    sample_weights = np.zeros(len(X_tr))
 
-    for tr_idx, val_idx in tscv.split(X_tr):
+    for fold_idx, (tr_idx, val_idx) in enumerate(tscv.split(X_tr)):
         X_fold_tr, X_fold_val = X_tr[tr_idx], X_tr[val_idx]
         y_fold_tr = y_tr[tr_idx]
+        sample_weights[val_idx] = (fold_idx + 1) / n_splits
         for m_idx, name in enumerate(model_names):
             m = clone(base_models[name])
             m.fit(X_fold_tr, y_fold_tr)
             oof[val_idx, m_idx] = m.predict_proba(X_fold_val)[:, 1]
 
+    covered = sample_weights > 0
     meta = LogisticRegression(max_iter=1000, random_state=42, C=1.0)
-    meta.fit(oof, y_tr)
+    meta.fit(oof[covered], y_tr[covered], sample_weight=sample_weights[covered])
     return meta
 
 
-_NON_MODEL_KEYS = {"stacked_meta", "optimal_threshold", "target_encode_maps", "global_cancel_mean"}
+_NON_MODEL_KEYS = {
+    "stacked_meta",
+    "optimal_threshold",
+    "target_encode_maps",
+    "global_cancel_mean",
+    "probability_calibrator",
+}
 
 
 def predict_stacked_proba(
     meta: LogisticRegression,
     base_models: dict,
     X: np.ndarray,
+    calibrator=None,
 ) -> np.ndarray:
-    """Generate stacked probability predictions for X using fitted base models + meta-learner."""
+    """
+    Generate stacked probability predictions for X using fitted base models + meta-learner.
+    If a fitted calibrator (e.g. IsotonicRegression) is supplied, raw stacked probs are
+    transformed through it and clipped to [0, 1] before being returned.
+    """
     model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
     level1 = np.column_stack([
         base_models[name].predict_proba(X)[:, 1]
         for name in model_names
     ])
-    return meta.predict_proba(level1)[:, 1]
+    raw = meta.predict_proba(level1)[:, 1]
+    return apply_probability_calibrator(calibrator, raw)
+
+
+def train_probability_calibrator(
+    base_models: dict,
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    n_splits: int = 5,
+):
+    """
+    Fit an isotonic regression on out-of-fold stacked predictions so raw stacked
+    probabilities map to true frequencies. Uses TimeSeriesSplit so calibration
+    data never leaks future info into the fit.
+
+    base_models must already contain a fitted ``stacked_meta`` — the same
+    meta-learner is reused per fold to convert refit base-model predictions
+    into stacked probabilities. Returns a fitted ``IsotonicRegression`` (callable
+    via ``apply_probability_calibrator``) or ``None`` if calibration is infeasible.
+    """
+    from sklearn.isotonic import IsotonicRegression
+
+    meta = base_models.get("stacked_meta")
+    if meta is None:
+        raise ValueError("base_models must contain 'stacked_meta' before calibration")
+
+    model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
+    if not model_names:
+        return None
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    oof_stacked = np.zeros(len(X_tr))
+    covered = np.zeros(len(X_tr), dtype=bool)
+
+    for tr_idx, val_idx in tscv.split(X_tr):
+        if len(np.unique(y_tr[tr_idx])) < 2:
+            continue
+        level1 = np.column_stack([
+            clone(base_models[name]).fit(X_tr[tr_idx], y_tr[tr_idx]).predict_proba(X_tr[val_idx])[:, 1]
+            for name in model_names
+        ])
+        oof_stacked[val_idx] = meta.predict_proba(level1)[:, 1]
+        covered[val_idx] = True
+
+    if covered.sum() < 10 or len(np.unique(y_tr[covered])) < 2:
+        return None
+
+    calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    calibrator.fit(oof_stacked[covered], y_tr[covered])
+    return calibrator
+
+
+def apply_probability_calibrator(calibrator, raw_proba: np.ndarray) -> np.ndarray:
+    """Apply a fitted calibrator. Returns probs clipped to [0, 1]. No-op if calibrator is None."""
+    raw_proba = np.asarray(raw_proba, dtype=float)
+    if calibrator is None:
+        return raw_proba
+    return np.clip(calibrator.transform(raw_proba), 0.0, 1.0)
 
 
 def find_optimal_threshold(
@@ -377,6 +476,93 @@ def find_optimal_threshold(
         if score > best_score:
             best_score, best_thresh = score, float(t)
     return best_thresh, best_score
+
+
+def get_segment_group(market_segment: str) -> str | None:
+    """Return the SEGMENT_GROUPS key for a given market_segment value, or None if unknown."""
+    for group, segments in SEGMENT_GROUPS.items():
+        if market_segment in segments:
+            return group
+    return None
+
+
+def train_segmented_cancellation_models(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    segment_labels_tr: np.ndarray,
+    X_te: np.ndarray,
+    y_te: np.ndarray,
+    segment_labels_te: np.ndarray,
+    xgb_params: dict | None = None,
+    lgb_params: dict | None = None,
+    catboost_params: dict | None = None,
+) -> dict:
+    """
+    Train per-segment-group cancellation models.
+
+    Splits training/test data by SEGMENT_GROUPS, then for each group trains the
+    full 6-model balanced ensemble + stacking meta-learner + threshold optimisation.
+
+    Groups with fewer than _MIN_SEGMENT_SAMPLES training rows or only one target
+    class are skipped. Returns a dict keyed by segment group name; each value is
+    a cancel_models bundle (same structure as the global model).
+    """
+    result = {}
+    segment_labels_tr = np.asarray(segment_labels_tr)
+    segment_labels_te = np.asarray(segment_labels_te)
+
+    for group_name, segments in SEGMENT_GROUPS.items():
+        tr_mask = np.isin(segment_labels_tr, segments)
+        te_mask = np.isin(segment_labels_te, segments)
+
+        X_g_tr = X_tr[tr_mask]
+        y_g_tr = y_tr[tr_mask]
+        X_g_te = X_te[te_mask]
+        y_g_te = y_te[te_mask]
+
+        if len(X_g_tr) < _MIN_SEGMENT_SAMPLES:
+            log.warning(
+                "Segment '%s' has only %d training samples — skipping",
+                group_name, len(X_g_tr),
+            )
+            continue
+
+        if len(np.unique(y_g_tr)) < 2:
+            log.warning("Segment '%s' has only one target class — skipping", group_name)
+            continue
+
+        log.info(
+            "Training segment '%s' model (%d train / %d test)...",
+            group_name, len(X_g_tr), len(X_g_te),
+        )
+
+        spw = compute_scale_pos_weight(y_g_tr)
+        cancel_models_g = train_cancellation_models_balanced(
+            X_g_tr,
+            y_g_tr,
+            scale_pos_weight=spw,
+            xgb_params=xgb_params,
+            lgb_params=lgb_params,
+            catboost_params=catboost_params,
+        )
+
+        stacked_meta_g = train_stacked_cancellation_model(cancel_models_g, X_g_tr, y_g_tr)
+        cancel_models_g["stacked_meta"] = stacked_meta_g
+
+        if len(X_g_te) > 0 and len(np.unique(y_g_te)) >= 2:
+            stacked_proba = predict_stacked_proba(stacked_meta_g, cancel_models_g, X_g_te)
+            optimal_threshold, optimal_acc = find_optimal_threshold(y_g_te, stacked_proba)
+            cancel_models_g["optimal_threshold"] = optimal_threshold
+            log.info(
+                "  Segment '%s' stacked — threshold=%.2f, accuracy=%.3f",
+                group_name, optimal_threshold, optimal_acc,
+            )
+        else:
+            cancel_models_g["optimal_threshold"] = 0.5
+
+        result[group_name] = cancel_models_g
+
+    return result
 
 
 def _km_curve(durations: np.ndarray, events: np.ndarray) -> pd.DataFrame:

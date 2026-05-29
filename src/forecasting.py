@@ -213,11 +213,13 @@ def make_lag_features(
 
     # Interaction features — capture weekday×seasonality effects
     df["season"] = ((df["month"] % 12) // 3).astype(int)  # 0=winter,1=spring,2=summer,3=autumn
-    df["dow_sin_x_month"] = df["dow_sin"] * df["month"]
-    df["dow_cos_x_month"] = df["dow_cos"] * df["month"]
     df["is_weekend_x_holiday"] = df["is_weekend"] * df["is_holiday"]
     df["school_x_weekend"] = df["is_school_holiday"] * df["is_weekend"]
     df["season_x_is_weekend"] = df["season"] * df["is_weekend"]
+    df["weekend_x_summer"] = df["is_weekend"] * (df["season"] == 2).astype(int)
+    df["holiday_x_season"] = df["is_holiday"] * df["season"]
+    if "lag_7" in df.columns:
+        df["lag_7_x_weekend"] = df["lag_7"] * df["is_weekend"]
 
     df.dropna(inplace=True)
     return df
@@ -397,6 +399,23 @@ def _build_forecast_row(
         if isinstance(extra_row, pd.DataFrame):
             extra_row = extra_row.iloc[0]
         row.update(extra_row.fillna(0.0).to_dict())
+
+    # Interaction features — must mirror make_lag_features so the inference
+    # row matches the training distribution. Without these, every interaction
+    # column silently defaults to 0.0 in the final dict comprehension.
+    month = int(row.get("month", 0))
+    is_weekend = int(row.get("is_weekend", 0))
+    is_holiday = int(row.get("is_holiday", 0))
+    is_school_holiday = int(row.get("is_school_holiday", 0))
+    season = (month % 12) // 3
+    row["season"] = season
+    row["is_weekend_x_holiday"] = is_weekend * is_holiday
+    row["school_x_weekend"] = is_school_holiday * is_weekend
+    row["season_x_is_weekend"] = season * is_weekend
+    row["weekend_x_summer"] = is_weekend * int(season == 2)
+    row["holiday_x_season"] = is_holiday * season
+    if "lag_7" in row:
+        row["lag_7_x_weekend"] = row["lag_7"] * is_weekend
 
     return pd.DataFrame([{k: row.get(k, 0.0) for k in feat_cols}])
 
@@ -762,22 +781,26 @@ def generate_oof_predictions(
             xgb_preds = forecast_xgb(m, cols, train, periods=val_len).values
             oof_xgb[val_idx] = xgb_preds
         except Exception:
-            oof_xgb[val_idx] = series.iloc[val_idx].values
+            # Leave NaN — substituting ground-truth would silently produce a
+            # perfect-fit line in the OOF chart and poison the stacking meta-learner.
+            pass
 
         try:
             pm = train_prophet_forecaster(train, holiday_country=holiday_country)
             prophet_df = forecast_prophet(pm, periods=val_len)
             oof_prophet[val_idx] = prophet_df["yhat"].values
         except Exception:
-            oof_prophet[val_idx] = series.iloc[val_idx].values
+            pass
 
         try:
             sarima_res = train_sarima_forecaster(train)
             oof_sarima[val_idx] = forecast_sarima(sarima_res, periods=val_len).values
         except Exception:
-            oof_sarima[val_idx] = series.iloc[val_idx].values
+            pass
 
-    mask = ~np.isnan(oof_xgb)
+    # Drop any row where any model failed — only rows with genuine predictions
+    # from all three models survive into the returned DataFrame.
+    mask = ~(np.isnan(oof_xgb) | np.isnan(oof_prophet) | np.isnan(oof_sarima))
     return pd.DataFrame(
         {
             "xgb": oof_xgb[mask],

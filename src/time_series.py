@@ -76,7 +76,7 @@ def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
 
     # Implied ADR: average daily rate derived from booked revenue / bookings
     bookings = grouped["daily_bookings"].replace(0, np.nan)
-    grouped["implied_adr"] = (grouped["daily_booked_revenue"] / bookings).fillna(0.0)
+    grouped["implied_adr"] = (grouped["daily_booked_revenue"] / bookings).ffill().fillna(0.0)
 
     # Net demand: bookings that are not cancelled; cleaner signal for demand forecasting
     grouped["net_daily_bookings"] = (
@@ -86,7 +86,7 @@ def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
     # Daily cancellation rate: lagged version is useful as a demand model extra_feature
     grouped["daily_cancellation_rate"] = (
         grouped["daily_cancellations"] / bookings
-    ).fillna(0.0)
+    ).ffill().fillna(0.0)
 
     return grouped
 

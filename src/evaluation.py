@@ -125,3 +125,83 @@ def classification_report_dict(
         "f1":        float(f1_score(y_true, y_pred, zero_division=0)),
         "roc_auc":   float(roc_auc_score(y_true, y_prob)),
     }
+
+
+def calibration_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+) -> dict:
+    """
+    Reliability diagnostics for probabilistic classifiers.
+
+    Returns
+    -------
+    {
+      "brier":  float,         # mean squared error of probability vs outcome
+      "ece":    float,         # Expected Calibration Error (equal-width bins)
+      "curve":  DataFrame[bin_lower, bin_upper, mean_pred, empirical_pos_rate, count],
+    }
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_prob = np.asarray(y_prob, dtype=float)
+    n = len(y_true)
+    if n == 0:
+        empty = pd.DataFrame(columns=["bin_lower", "bin_upper", "mean_pred", "empirical_pos_rate", "count"])
+        return {"brier": float("nan"), "ece": float("nan"), "curve": empty}
+
+    brier = float(np.mean((y_prob - y_true) ** 2))
+
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    rows = []
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        if i == n_bins - 1:
+            mask = (y_prob >= lo) & (y_prob <= hi)
+        else:
+            mask = (y_prob >= lo) & (y_prob < hi)
+        count = int(mask.sum())
+        if count == 0:
+            rows.append({
+                "bin_lower": float(lo),
+                "bin_upper": float(hi),
+                "mean_pred": float("nan"),
+                "empirical_pos_rate": float("nan"),
+                "count": 0,
+            })
+            continue
+        mean_pred = float(y_prob[mask].mean())
+        emp = float(y_true[mask].mean())
+        rows.append({
+            "bin_lower": float(lo),
+            "bin_upper": float(hi),
+            "mean_pred": mean_pred,
+            "empirical_pos_rate": emp,
+            "count": count,
+        })
+        ece += (count / n) * abs(mean_pred - emp)
+
+    return {"brier": brier, "ece": float(ece), "curve": pd.DataFrame(rows)}
+
+
+def empirical_interval_coverage(
+    y_true: np.ndarray,
+    y_lower: np.ndarray,
+    y_upper: np.ndarray,
+) -> dict:
+    """
+    Fraction of points where y_lower <= y_true <= y_upper, plus mean band width.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_lower = np.asarray(y_lower, dtype=float)
+    y_upper = np.asarray(y_upper, dtype=float)
+    n = len(y_true)
+    if n == 0:
+        return {"coverage": float("nan"), "mean_width": float("nan"), "n": 0}
+    inside = (y_lower <= y_true) & (y_true <= y_upper)
+    return {
+        "coverage": float(inside.mean()),
+        "mean_width": float(np.mean(y_upper - y_lower)),
+        "n": int(n),
+    }

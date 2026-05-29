@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app import get_or_train_models, load_and_prepare_data
 from src.analytics import estimate_staffing
 from src.config import APP_CONFIG
+from src.conformal import forecast_conformal
 from src.forecasting import forecast_xgb, forecast_xgb_with_intervals, naive_baseline_forecast
 from src.model_specs import FORECAST_LAGS
 from src.revenue_management import (
@@ -67,8 +68,12 @@ total_rooms = st.sidebar.number_input(
 )
 
 demand_series = daily_df["daily_bookings"]
+conformal_bundle = models.get("xgb_demand_conformal")
 interval_models = models.get("xgb_demand_intervals")
-if interval_models:
+if conformal_bundle is not None:
+    demand_band_df = forecast_conformal(conformal_bundle, demand_series, periods=30)
+    forecast_30 = demand_band_df.set_index("ds")["yhat"]
+elif interval_models:
     demand_band_df = forecast_xgb_with_intervals(interval_models, demand_series, periods=30)
     forecast_30 = demand_band_df.set_index("ds")["yhat"]
 else:

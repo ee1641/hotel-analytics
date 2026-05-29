@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from src.preprocessing import drop_leaky_features, encode_categoricals
 from src.cancellation_evaluation import _align_to_feature_columns
+from src.cancellation import apply_probability_calibrator, predict_stacked_proba
 
 
 def score_bookings(
@@ -24,7 +25,11 @@ def score_bookings(
     Parameters
     ----------
     bookings_df : raw bookings DataFrame (same schema as hotel_bookings.csv)
-    cancellation_model : fitted classifier with predict_proba
+    cancellation_model : either a fitted classifier with predict_proba OR a full
+        ``cancel_models`` dict (from services.get_or_train_models). When a dict
+        is supplied and contains ``stacked_meta``, predictions use the stacked
+        ensemble with the calibrated probability path; downstream callers
+        (overbooking, alerts) should pass the dict to get calibrated probs.
     shap_explainer : optional shap.TreeExplainer for per-prediction risk factors
 
     Returns
@@ -51,7 +56,14 @@ def score_bookings(
         shap_feature_names = list(X.columns)
         shap_feature_values = X
 
-    if hasattr(cancellation_model, "predict_proba"):
+    if isinstance(cancellation_model, dict) and "stacked_meta" in cancellation_model:
+        proba = predict_stacked_proba(
+            cancellation_model["stacked_meta"],
+            cancellation_model,
+            X_for_model,
+            calibrator=cancellation_model.get("probability_calibrator"),
+        )
+    elif hasattr(cancellation_model, "predict_proba"):
         proba = cancellation_model.predict_proba(X_for_model)[:, 1]
     else:
         proba = cancellation_model.predict(X_for_model).astype(float)

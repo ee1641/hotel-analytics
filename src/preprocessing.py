@@ -100,6 +100,16 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["adr_vs_hotel_mean"] = 1.0
 
+    # ADR relative to segment+month average — captures price sensitivity more precisely.
+    # A guest who paid 2× the typical July Online-TA rate has much higher cancel risk.
+    # Uses arrival_date_month (raw column) since arrival_date is built in a later step.
+    if "adr" in df.columns and "market_segment" in df.columns and "arrival_date_month" in df.columns:
+        seg_month_mean = (
+            df.groupby(["market_segment", "arrival_date_month"])["adr"]
+            .transform(lambda x: x.replace(0, np.nan).mean())
+        )
+        df["adr_vs_segment_month_mean"] = (df["adr"] / seg_month_mean.clip(lower=1)).clip(0, 10).fillna(1.0)
+
     # Previous cancellation rate ratio — more informative than raw counts alone
     if "previous_cancellations" in df.columns and "previous_bookings_not_canceled" in df.columns:
         df["previous_cancellation_rate"] = (
@@ -174,8 +184,8 @@ LEAKY_COLUMNS = [
     "reservation_status_date",   # directly encodes the target
     "realized_revenue",          # realized_revenue = revenue × (1 - is_canceled) → 0 for cancellations
     "assigned_room_type",        # assigned at check-in, not at booking time
-    "booking_changes",           # accumulated post-booking
-    "days_in_waiting_list",      # accumulated post-booking
+    "booking_changes",           # terminal amendment count at check-in/cancellation, not a booking-time snapshot
+    # days_in_waiting_list: fully known at booking confirmation — kept as a feature
 ]
 
 # Columns to label-encode before training

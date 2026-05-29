@@ -43,8 +43,10 @@ from src.forecasting import (
     tune_xgb_forecaster,
 )
 from src.ingestion import load_cancellation_prediction_csv
+from src.conformal import split_conformal_calibrate
 from src.model_specs import (
     CANCELLATION_MODEL_VERSION,
+    CONFORMAL_INTERVAL_VERSION,
     ENSEMBLE_WEIGHTS_VERSION,
     EVAL_METRICS_VERSION,
     FORECAST_LAGS,
@@ -384,6 +386,23 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             # Both cached — no tuning needed; store a sentinel so eval can fall back gracefully.
             _series_best_params.setdefault(column, None)
 
+        # Conformal interval bundle for the same series — preferred by API/UI
+        # callers when present because it carries a coverage guarantee. Stored
+        # only for the booked-revenue series; realized/expected stay on
+        # quantile bands for now.
+        if xgb_key == "xgb_revenue":
+            conformal_key = "xgb_revenue_conformal"
+            if _artifact_current(conformal_key, CONFORMAL_INTERVAL_VERSION, models_dir=models_path):
+                results[conformal_key] = model_cache.load_artifact(conformal_key, models_dir=models_path)
+            else:
+                _best_for_conf = _series_best_params.get(column) or {}
+                rev_conformal = split_conformal_calibrate(
+                    series, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+                    extra_features=_extra, **_best_for_conf,
+                )
+                results[conformal_key] = rev_conformal
+                _save_versioned(conformal_key, rev_conformal, CONFORMAL_INTERVAL_VERSION, models_path)
+
         if _artifact_current(prophet_key, PROPHET_MODEL_VERSION, models_dir=models_path):
             results[prophet_key] = model_cache.load_artifact(prophet_key, models_dir=models_path)
         else:
@@ -419,6 +438,17 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             _save_versioned("xgb_demand_intervals", interval_models, INTERVAL_MODEL_VERSION, models_path)
     else:
         _series_best_params.setdefault("daily_bookings", None)
+
+    if _artifact_current("xgb_demand_conformal", CONFORMAL_INTERVAL_VERSION, models_dir=models_path):
+        results["xgb_demand_conformal"] = model_cache.load_artifact("xgb_demand_conformal", models_dir=models_path)
+    else:
+        _best_for_conf = _series_best_params.get("daily_bookings") or {}
+        dem_conformal = split_conformal_calibrate(
+            dem_series, lags=FORECAST_LAGS, holdout_days=60, alpha=0.10,
+            extra_features=_extra_dem, **_best_for_conf,
+        )
+        results["xgb_demand_conformal"] = dem_conformal
+        _save_versioned("xgb_demand_conformal", dem_conformal, CONFORMAL_INTERVAL_VERSION, models_path)
 
     if _artifact_current("prophet_demand", PROPHET_MODEL_VERSION, models_dir=models_path):
         results["prophet_demand"] = model_cache.load_artifact("prophet_demand", models_dir=models_path)
@@ -621,17 +651,18 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         dem_train = dem_series.iloc[:-test_days]
         dem_test = dem_series.iloc[-test_days:]
 
-        # OTB + weather features aligned to training split (no leakage — only uses train dates)
-        _otb_eval = _combined_extra(dem_train.index)
-
         # Baseline (fixed default hyperparameters, no OTB)
         xgb_base_m, xgb_base_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS)
         dem_base_preds = forecast_xgb(xgb_base_m, xgb_base_c, dem_train, len(dem_test))
         dem_base_preds.index = dem_test.index
 
+        # Tuned — matches production: OTB+weather extras and CV-tuned params
+        _otb_eval_dem = _combined_extra(dem_train.index)
         dem_best_p = _series_best_params.get("daily_bookings") or {}
-        xgb_dem_m, xgb_dem_c = train_xgb_forecaster(dem_train, lags=FORECAST_LAGS,
-                                                      extra_features=_otb_eval, **dem_best_p)
+        xgb_dem_m, xgb_dem_c = train_xgb_forecaster(
+            dem_train, lags=FORECAST_LAGS,
+            extra_features=_otb_eval_dem, **dem_best_p,
+        )
         dem_xgb_preds = forecast_xgb(xgb_dem_m, xgb_dem_c, dem_train, len(dem_test))
         dem_xgb_preds.index = dem_test.index
 
@@ -650,6 +681,11 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             "demand_naive": regression_metrics(dem_test.values, dem_naive.values),
             "demand_ensemble": regression_metrics(dem_test.values, dem_ensemble.values),
             "demand_ensemble_xgb_weight": _dem_w,
+            # Raw arrays for chart backtest overlay
+            "demand_xgb_actuals": dem_test.values.tolist(),
+            "demand_xgb_preds": dem_xgb_preds.values.tolist(),
+            "demand_prophet_preds": dem_prophet_df["yhat"].values.tolist(),
+            "demand_naive_preds": dem_naive.values.tolist(),
         }
 
         for metric_xgb, metric_prophet, metric_naive, column in revenue_eval_specs:
@@ -657,17 +693,18 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             rev_train = revenue_series.iloc[:-test_days]
             rev_test = revenue_series.iloc[-test_days:]
 
-            # OTB + weather features aligned to this revenue series' training split
-            _otb_rev_eval = _combined_extra(rev_train.index)
-
-            # Baseline (no OTB)
+            # Baseline — fresh model with default params
             xgb_rev_base, xgb_rev_base_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS)
             rev_base_preds = forecast_xgb(xgb_rev_base, xgb_rev_base_c, rev_train, len(rev_test))
             rev_base_preds.index = rev_test.index
 
+            # Tuned — matches production: OTB+weather extras and CV-tuned params
+            _otb_eval_rev = _combined_extra(rev_train.index)
             rev_best_p = _series_best_params.get(column) or {}
-            xgb_rev_m, xgb_rev_c = train_xgb_forecaster(rev_train, lags=FORECAST_LAGS,
-                                                          extra_features=_otb_rev_eval, **rev_best_p)
+            xgb_rev_m, xgb_rev_c = train_xgb_forecaster(
+                rev_train, lags=FORECAST_LAGS,
+                extra_features=_otb_eval_rev, **rev_best_p,
+            )
             rev_xgb_preds = forecast_xgb(xgb_rev_m, xgb_rev_c, rev_train, len(rev_test))
             rev_xgb_preds.index = rev_test.index
 
@@ -682,6 +719,11 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             eval_metrics[metric_prophet] = regression_metrics(rev_test.values, rev_prophet_df["yhat"].values)
             eval_metrics[metric_naive] = regression_metrics(rev_test.values, rev_naive.values)
             eval_metrics[f"{metric_xgb}_ensemble"] = regression_metrics(rev_test.values, rev_ensemble.values)
+            # Raw arrays for chart backtest overlay
+            eval_metrics[f"{metric_xgb}_actuals"] = rev_test.values.tolist()
+            eval_metrics[f"{metric_xgb}_preds"] = rev_xgb_preds.values.tolist()
+            eval_metrics[f"{metric_prophet}_preds"] = rev_prophet_df["yhat"].values.tolist()
+            eval_metrics[f"{metric_naive}_preds"] = rev_naive.values.tolist()
 
         # Per-hotel-type eval metrics
         _hotel_rev_col_map = {
@@ -716,6 +758,51 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             n_splits=4,
             forecast_horizon=30,
         )
+
+        # Empirical conformal interval coverage on the same 30-day holdout:
+        # calibrate a fresh conformal bundle on the training portion and
+        # measure how often the resulting 90% band contains the truth.
+        from src.evaluation import empirical_interval_coverage as _eic
+        from src.conformal import (
+            forecast_conformal as _fc,
+            split_conformal_calibrate as _scc,
+        )
+        try:
+            booked_series = revenue_series_lookup["daily_booked_revenue"]
+            rev_cal_train = booked_series.iloc[:-test_days]
+            rev_cal_test = booked_series.iloc[-test_days:]
+            rev_cal_bundle = _scc(rev_cal_train, lags=FORECAST_LAGS,
+                                   holdout_days=60, alpha=0.10)
+            rev_band = _fc(rev_cal_bundle, rev_cal_train, periods=test_days)
+            eval_metrics["revenue_conformal_coverage"] = {
+                **_eic(rev_cal_test.values,
+                       rev_band["yhat_lower"].values,
+                       rev_band["yhat_upper"].values),
+                "alpha": float(rev_cal_bundle["alpha"]),
+                "nominal_coverage": 1.0 - float(rev_cal_bundle["alpha"]),
+            }
+        except Exception as exc:
+            logging.warning("Revenue conformal coverage eval failed: %s", exc)
+
+        try:
+            dem_cal_train = dem_series.iloc[:-test_days]
+            dem_cal_test = dem_series.iloc[-test_days:]
+            _dem_eval_extra = _combined_extra(dem_cal_train.index)
+            dem_cal_bundle = _scc(dem_cal_train, lags=FORECAST_LAGS,
+                                   holdout_days=60, alpha=0.10,
+                                   extra_features=_dem_eval_extra)
+            _dem_future_extra = _combined_extra(dem_cal_test.index)
+            dem_band = _fc(dem_cal_bundle, dem_cal_train, periods=test_days,
+                            future_features=_dem_future_extra)
+            eval_metrics["demand_conformal_coverage"] = {
+                **_eic(dem_cal_test.values,
+                       dem_band["yhat_lower"].values,
+                       dem_band["yhat_upper"].values),
+                "alpha": float(dem_cal_bundle["alpha"]),
+                "nominal_coverage": 1.0 - float(dem_cal_bundle["alpha"]),
+            }
+        except Exception as exc:
+            logging.warning("Demand conformal coverage eval failed: %s", exc)
 
         try:
             second_df = load_cancellation_prediction_csv("cancellation_Prediction.csv")

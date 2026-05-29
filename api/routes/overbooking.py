@@ -24,8 +24,11 @@ def get_overbooking(
         df, _ = load_and_prepare_data(dataset_context=context)
         models = get_or_train_models(dataset_context=context)
         rec = calculate_overbooking_recommendation(
-            df, models["cancel_models"]["xgboost"], target_date,
+            df, models["cancel_models"], target_date,
             total_rooms, overbooking_cost, empty_room_cost,
+            feature_columns=models.get("feature_columns"),
+            label_encoders=models.get("label_encoders"),
+            feature_defaults=models.get("feature_defaults"),
         )
         return {"status": "ok", "data": {"hotel_id": hotel_id, "date": str(target_date), **rec}}
     except FileNotFoundError as e:
