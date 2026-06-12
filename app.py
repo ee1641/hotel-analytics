@@ -762,7 +762,10 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         # Empirical conformal interval coverage on the same 30-day holdout:
         # calibrate a fresh conformal bundle on the training portion and
         # measure how often the resulting 90% band contains the truth.
-        from src.evaluation import empirical_interval_coverage as _eic
+        from src.evaluation import (
+            empirical_interval_coverage as _eic,
+            interval_coverage_by_horizon as _ich,
+        )
         from src.conformal import (
             forecast_conformal as _fc,
             split_conformal_calibrate as _scc,
@@ -780,6 +783,9 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                        rev_band["yhat_upper"].values),
                 "alpha": float(rev_cal_bundle["alpha"]),
                 "nominal_coverage": 1.0 - float(rev_cal_bundle["alpha"]),
+                "by_bin": _ich(rev_cal_test.values,
+                               rev_band["yhat_lower"].values,
+                               rev_band["yhat_upper"].values)["by_bin"],
             }
         except Exception as exc:
             logging.warning("Revenue conformal coverage eval failed: %s", exc)
@@ -800,6 +806,9 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
                        dem_band["yhat_upper"].values),
                 "alpha": float(dem_cal_bundle["alpha"]),
                 "nominal_coverage": 1.0 - float(dem_cal_bundle["alpha"]),
+                "by_bin": _ich(dem_cal_test.values,
+                               dem_band["yhat_lower"].values,
+                               dem_band["yhat_upper"].values)["by_bin"],
             }
         except Exception as exc:
             logging.warning("Demand conformal coverage eval failed: %s", exc)

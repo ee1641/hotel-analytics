@@ -126,6 +126,17 @@ def test_get_or_train_models_rejects_tiny_daily_history(monkeypatch):
         "load_artifact",
         lambda name, *args, **kwargs: {"xgboost": object()} if name == "cancel_models" else None,
     )
+    # _artifact_current also reads version metadata from disk; without this the
+    # mocked cancel_models cache is treated as stale and training runs anyway.
+    monkeypatch.setattr(
+        app_mod.model_cache,
+        "load_artifact_with_metadata",
+        lambda name, *args, **kwargs: (
+            ({"xgboost": object()}, {"version": app_mod.CANCELLATION_MODEL_VERSION})
+            if name == "cancel_models"
+            else (None, {})
+        ),
+    )
     monkeypatch.setattr(
         app_mod,
         "_build_expected_revenue_views",

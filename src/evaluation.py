@@ -205,3 +205,49 @@ def empirical_interval_coverage(
         "mean_width": float(np.mean(y_upper - y_lower)),
         "n": int(n),
     }
+
+
+def interval_coverage_by_horizon(
+    y_true: np.ndarray,
+    y_lower: np.ndarray,
+    y_upper: np.ndarray,
+    bin_edges: tuple[int, ...] = (7, 14, 30),
+) -> dict:
+    """
+    Interval coverage and width disaggregated by forecast horizon.
+
+    Positions in the arrays are horizon steps (1-indexed): element 0 is the
+    1-day-ahead forecast, element 13 the 14-day-ahead forecast, etc. Steps
+    beyond the last bin edge are pooled into the last bin.
+
+    Returns
+    -------
+    {
+      "overall": {coverage, mean_width, n},
+      "by_bin":  {"1-7": {coverage, mean_width, n}, "8-14": {...}, ...},
+    }
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_lower = np.asarray(y_lower, dtype=float)
+    y_upper = np.asarray(y_upper, dtype=float)
+    bin_edges = [int(e) for e in bin_edges]
+
+    horizons = np.arange(1, len(y_true) + 1)
+    by_bin = {}
+    prev_edge = 0
+    for i, edge in enumerate(bin_edges):
+        if i == len(bin_edges) - 1:
+            mask = horizons > prev_edge  # last bin absorbs longer horizons
+            label = f"{prev_edge + 1}-{max(edge, len(y_true))}" if len(y_true) > edge else f"{prev_edge + 1}-{edge}"
+        else:
+            mask = (horizons > prev_edge) & (horizons <= edge)
+            label = f"{prev_edge + 1}-{edge}"
+        by_bin[label] = empirical_interval_coverage(
+            y_true[mask], y_lower[mask], y_upper[mask]
+        )
+        prev_edge = edge
+
+    return {
+        "overall": empirical_interval_coverage(y_true, y_lower, y_upper),
+        "by_bin": by_bin,
+    }

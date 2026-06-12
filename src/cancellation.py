@@ -382,6 +382,7 @@ _NON_MODEL_KEYS = {
     "target_encode_maps",
     "global_cancel_mean",
     "probability_calibrator",
+    "holdout_metrics",
 }
 
 

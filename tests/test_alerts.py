@@ -214,3 +214,86 @@ def test_format_alert_email_all_severities():
     assert "critical" in html.lower()
     assert "warning"  in html.lower()
     assert "info"     in html.lower()
+
+
+# ---------------------------------------------------------------------------
+# Model drift alert (reads metrics_history.jsonl written by scripts/retrain.py)
+# ---------------------------------------------------------------------------
+
+def _write_history(path, drift, timestamp=None):
+    import json
+    snapshot = {
+        "timestamp": timestamp or pd.Timestamp.now(tz="UTC").isoformat(),
+        "dataset_id": "demo",
+        "demand_mape": 16.0,
+        "drift": drift,
+    }
+    path.write_text(json.dumps(snapshot) + "\n", encoding="utf-8")
+
+
+def test_model_drift_alert_emitted_from_history(tmp_path):
+    history = tmp_path / "metrics_history.jsonl"
+    _write_history(history, drift=[
+        {"metric": "demand_mape", "current": 16.0, "baseline": 12.0,
+         "severity": "critical", "message": "demand_mape rose to 16.0%"},
+        {"metric": "revenue_coverage", "current": 0.84, "baseline": None,
+         "severity": "warning", "message": "revenue_coverage below floor"},
+    ])
+    df = _make_bookings()
+    forecast = _make_forecast(value=70.0)
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 5})
+        alerts = generate_daily_alerts(
+            df, forecast, MagicMock(),
+            {"metrics_history_path": str(history)},
+        )
+    drift_alerts = [a for a in alerts if a.type == "model_drift"]
+    assert len(drift_alerts) == 1
+    # Any critical finding promotes the whole alert to critical.
+    assert drift_alerts[0].severity == "critical"
+    assert "demand_mape" in drift_alerts[0].description
+    assert len(drift_alerts[0].data["findings"]) == 2
+
+
+def test_no_drift_alert_when_history_clean_or_missing(tmp_path):
+    df = _make_bookings()
+    forecast = _make_forecast(value=70.0)
+
+    # Missing file
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 5})
+        alerts = generate_daily_alerts(
+            df, forecast, MagicMock(),
+            {"metrics_history_path": str(tmp_path / "missing.jsonl")},
+        )
+    assert "model_drift" not in [a.type for a in alerts]
+
+    # Clean snapshot (empty drift list)
+    history = tmp_path / "metrics_history.jsonl"
+    _write_history(history, drift=[])
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 5})
+        alerts = generate_daily_alerts(
+            df, forecast, MagicMock(),
+            {"metrics_history_path": str(history)},
+        )
+    assert "model_drift" not in [a.type for a in alerts]
+
+
+def test_no_drift_alert_when_snapshot_stale(tmp_path):
+    """Findings older than drift_alert_max_age_days must not keep alerting."""
+    history = tmp_path / "metrics_history.jsonl"
+    stale_ts = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=120)).isoformat()
+    _write_history(history, drift=[
+        {"metric": "demand_mape", "current": 16.0, "baseline": 12.0,
+         "severity": "warning", "message": "old finding"},
+    ], timestamp=stale_ts)
+    df = _make_bookings()
+    forecast = _make_forecast(value=70.0)
+    with patch("src.alerts.score_bookings") as mock_score:
+        mock_score.return_value = pd.DataFrame({"cancel_probability": [0.1] * 5})
+        alerts = generate_daily_alerts(
+            df, forecast, MagicMock(),
+            {"metrics_history_path": str(history)},
+        )
+    assert "model_drift" not in [a.type for a in alerts]

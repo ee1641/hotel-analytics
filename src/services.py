@@ -32,8 +32,10 @@ from src.cancellation import (
 from src.cancellation_evaluation import evaluate_cross_dataset
 from src.config import APP_CONFIG
 from src.evaluation import (
+    calibration_metrics,
     empirical_interval_coverage,
     forecast_error_breakdown,
+    interval_coverage_by_horizon,
     regression_metrics,
     ts_cross_val_scores,
 )
@@ -444,6 +446,29 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         except Exception as exc:
             log.warning("Stacked model eval failed: %s", exc)
 
+        # Persist holdout metrics of the calibrated stacked classifier so drift
+        # monitoring (src/monitoring.py) can snapshot them without re-running
+        # the holdout evaluation.
+        try:
+            holdout_proba = predict_stacked_proba(
+                stacked_meta, cancel_models, X_te.values,
+                calibrator=cancel_models.get("probability_calibrator"),
+            )
+            thresh = float(cancel_models.get("optimal_threshold", 0.5))
+            from sklearn.metrics import accuracy_score as _acc, roc_auc_score as _auc
+            cal_diag = calibration_metrics(y_te.values, holdout_proba)
+            cancel_models["holdout_metrics"] = {
+                "accuracy": float(_acc(y_te.values, (holdout_proba >= thresh).astype(int))),
+                "brier": float(cal_diag["brier"]),
+                "ece": float(cal_diag["ece"]),
+                "roc_auc": float(_auc(y_te.values, holdout_proba)),
+                "threshold": thresh,
+                "n_test": int(len(y_te)),
+            }
+        except Exception as exc:
+            log.warning("Cancellation holdout metrics capture failed: %s", exc)
+            cancel_models["holdout_metrics"] = None
+
         # Store target encoding maps alongside label encoders for inference
         cancel_models["target_encode_maps"] = target_encode_maps
         cancel_models["global_cancel_mean"] = global_cancel_mean
@@ -552,6 +577,11 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
                 ),
                 "alpha": float(rev_cal_bundle["alpha"]),
                 "nominal_coverage": 1.0 - float(rev_cal_bundle["alpha"]),
+                "by_bin": interval_coverage_by_horizon(
+                    rev_eval_test.values,
+                    rev_band["yhat_lower"].values,
+                    rev_band["yhat_upper"].values,
+                )["by_bin"],
             }
         except Exception as exc:
             log.warning("Revenue conformal coverage eval failed: %s", exc)
@@ -573,6 +603,11 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
                 ),
                 "alpha": float(dem_cal_bundle["alpha"]),
                 "nominal_coverage": 1.0 - float(dem_cal_bundle["alpha"]),
+                "by_bin": interval_coverage_by_horizon(
+                    dem_eval_test.values,
+                    dem_band["yhat_lower"].values,
+                    dem_band["yhat_upper"].values,
+                )["by_bin"],
             }
         except Exception as exc:
             log.warning("Demand conformal coverage eval failed: %s", exc)

@@ -13,12 +13,16 @@ def get_alerts(hotel_id: str, authenticated_hotel_id: str = Depends(verify_api_k
         from src.services import load_and_prepare_data, get_or_train_models
         from src.alerts import generate_daily_alerts
         from src.forecasting import forecast_xgb
+        from src.monitoring import history_path_for
         context = resolve_hotel_dataset_context(hotel_id)
         df, daily_df = load_and_prepare_data(dataset_context=context)
         models = get_or_train_models(dataset_context=context)
         xgb_model, feat_cols = models["xgb_demand"]
         forecast = forecast_xgb(xgb_model, feat_cols, daily_df["daily_bookings"], periods=30)
-        alerts = generate_daily_alerts(df, forecast, models["cancel_models"], {})
+        alerts = generate_daily_alerts(
+            df, forecast, models["cancel_models"],
+            {"metrics_history_path": str(history_path_for(context))},
+        )
         from dataclasses import asdict
         return {"status": "ok", "data": [asdict(a) for a in alerts]}
     except FileNotFoundError as e:

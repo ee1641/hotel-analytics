@@ -13,10 +13,10 @@ FORECAST_TUNE_N_SPLITS = 3  # expanding-window time-series CV folds
 FORECAST_MODEL_VERSION        = "forecast_v17_interactions"
 PROPHET_MODEL_VERSION         = "prophet_v3_school_holidays"
 INTERVAL_MODEL_VERSION        = "forecast_intervals_v13_interactions"
-CONFORMAL_INTERVAL_VERSION    = "conformal_v1_split"
-CANCELLATION_MODEL_VERSION    = "cancellation_v11_calibrated"
+CONFORMAL_INTERVAL_VERSION    = "conformal_v2_adaptive_bins"
+CANCELLATION_MODEL_VERSION    = "cancellation_v12_holdout_metrics"
 SURVIVAL_MODEL_VERSION        = "cancellation_survival_v1"
-EVAL_METRICS_VERSION          = "evaluation_v19_calibration"
+EVAL_METRICS_VERSION          = "evaluation_v20_binned_coverage"
 DIRECT_FORECAST_MODEL_VERSION = "forecast_direct_v7_interactions"
 ADR_MODEL_VERSION             = "adr_v2_ffill"
 

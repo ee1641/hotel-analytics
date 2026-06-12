@@ -45,6 +45,8 @@ config = {
     "cancel_risk_threshold": cancel_threshold,
     "low_occupancy_threshold": low_occ_threshold,
     "total_rooms": total_rooms,
+    # Written by scripts/retrain.py; powers the model_drift alert.
+    "metrics_history_path": "data/metrics_history.jsonl",
 }
 
 # ---------------------------------------------------------------------------

@@ -5,8 +5,10 @@ Generates prioritised alerts for hotel operators based on cancellation risk,
 demand forecasts, and occupancy levels. Alerts are sorted by severity so
 critical issues surface first.
 """
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 import pandas as pd
 import numpy as np
@@ -48,6 +50,8 @@ def generate_daily_alerts(
         occupancy_overbook_threshold (float, default 0.9)
         low_occupancy_threshold (float, default 0.6)
         total_rooms (int, default 100)
+        metrics_history_path (str, default "data/metrics_history.jsonl")
+        drift_alert_max_age_days (int, default 45)
 
     Returns
     -------
@@ -64,6 +68,8 @@ def generate_daily_alerts(
         "occupancy_overbook_threshold": 0.9,
         "low_occupancy_threshold": 0.6,
         "total_rooms": 100,
+        "metrics_history_path": "data/metrics_history.jsonl",
+        "drift_alert_max_age_days": 45,
         **config,
     }
 
@@ -177,6 +183,68 @@ def generate_daily_alerts(
                 affected_date=low_days.index[0].date(),
                 data={"low_days": len(low_days), "capacity": capacity},
             ))
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # 5. Model drift — latest retrain snapshot reported degraded metrics
+    #    (written by scripts/retrain.py via src/monitoring.py)
+    # ------------------------------------------------------------------
+    try:
+        history_path = Path(cfg["metrics_history_path"])
+        if history_path.exists():
+            last_snapshot = None
+            for line in history_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    last_snapshot = record
+
+            findings = (last_snapshot or {}).get("drift") or []
+            ts_raw = (last_snapshot or {}).get("timestamp")
+            # Freshness is judged against wall-clock time, not the dataset's
+            # anchor date — snapshots are written at retrain time regardless of
+            # how old the bookings data is.
+            snapshot_ts = pd.Timestamp(ts_raw) if ts_raw else None
+            if snapshot_ts is not None and snapshot_ts.tzinfo is None:
+                snapshot_ts = snapshot_ts.tz_localize("UTC")
+            fresh = (
+                snapshot_ts is not None
+                and pd.Timestamp.now(tz="UTC") - snapshot_ts
+                <= pd.Timedelta(days=cfg["drift_alert_max_age_days"])
+            )
+            if findings and fresh:
+                severity = (
+                    "critical"
+                    if any(f.get("severity") == "critical" for f in findings)
+                    else "warning"
+                )
+                messages = [f.get("message", "") for f in findings if f.get("message")]
+                alerts.append(Alert(
+                    type="model_drift",
+                    severity=severity,
+                    title=f"Model Drift: {len(findings)} Metric(s) Degraded",
+                    description=(
+                        "; ".join(messages)
+                        or "The latest retrain flagged degraded model metrics."
+                    ),
+                    recommended_action=(
+                        "Investigate recent data quality, then rerun "
+                        "scripts/retrain.py. The Validation page charts the "
+                        "metric history."
+                    ),
+                    affected_date=today,
+                    data={
+                        "findings": findings,
+                        "snapshot_timestamp": ts_raw,
+                        "dataset_id": (last_snapshot or {}).get("dataset_id"),
+                    },
+                ))
     except Exception:
         pass
 

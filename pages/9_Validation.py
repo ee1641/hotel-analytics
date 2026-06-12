@@ -93,6 +93,72 @@ if _eval_metrics:
         st.dataframe(pd.DataFrame(_coverage_rows), width='stretch', hide_index=True)
     st.divider()
 
+# ---------------------------------------------------------------------------
+# Section 0b — Metrics over time (one snapshot per scripts/retrain.py run)
+# ---------------------------------------------------------------------------
+_history_file = "data/metrics_history.jsonl"
+try:
+    _history = (
+        pd.read_json(_history_file, lines=True)
+        if os.path.exists(_history_file) else pd.DataFrame()
+    )
+except Exception:
+    _history = pd.DataFrame()
+
+if not _history.empty and "timestamp" in _history.columns:
+    st.subheader("Model Metrics Over Time")
+    st.caption(
+        "One snapshot per `scripts/retrain.py` run. Rising MAPE or coverage below the "
+        "0.85/0.80 bands triggers a model_drift alert on the Alerts page."
+    )
+    _history["timestamp"] = pd.to_datetime(_history["timestamp"], errors="coerce", utc=True)
+    _history = _history.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    _hist_col1, _hist_col2 = st.columns(2)
+    with _hist_col1:
+        _mape_fig = go.Figure()
+        for _col, _label in [("demand_mape", "Demand MAPE"), ("revenue_mape", "Revenue MAPE")]:
+            if _col in _history.columns:
+                _mape_fig.add_trace(go.Scatter(
+                    x=_history["timestamp"], y=_history[_col],
+                    mode="lines+markers", name=_label,
+                ))
+        _mape_fig.update_layout(
+            yaxis_title="MAPE (%)", height=320,
+            margin=dict(t=20, b=20, l=20, r=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(_mape_fig, width='stretch')
+    with _hist_col2:
+        _cov_fig = go.Figure()
+        for _col, _label in [("revenue_coverage", "Revenue coverage"),
+                             ("demand_coverage", "Demand coverage")]:
+            if _col in _history.columns:
+                _cov_fig.add_trace(go.Scatter(
+                    x=_history["timestamp"], y=_history[_col],
+                    mode="lines+markers", name=_label,
+                ))
+        _cov_fig.add_hline(y=0.90, line_dash="dash", line_color="gray",
+                           annotation_text="nominal 90%")
+        _cov_fig.add_hline(y=0.85, line_dash="dot", line_color="orange")
+        _cov_fig.add_hline(y=0.80, line_dash="dot", line_color="red")
+        _cov_fig.update_layout(
+            yaxis_title="Interval coverage", yaxis=dict(range=[0.5, 1.02]), height=320,
+            margin=dict(t=20, b=20, l=20, r=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(_cov_fig, width='stretch')
+
+    _last_drift = _history.iloc[-1].get("drift") if "drift" in _history.columns else None
+    if isinstance(_last_drift, list) and _last_drift:
+        for _f in _last_drift:
+            _msg = _f.get("message", str(_f)) if isinstance(_f, dict) else str(_f)
+            _sev = _f.get("severity", "warning") if isinstance(_f, dict) else "warning"
+            (st.error if _sev == "critical" else st.warning)(f"Drift: {_msg}")
+    else:
+        st.success("No drift detected in the latest retrain snapshot.")
+    st.divider()
+
 st.caption(
     "Upload a bookings CSV with known outcomes to run a blind test of the trained "
     "cancellation model. Predictions are generated without using the `is_canceled` column, "
