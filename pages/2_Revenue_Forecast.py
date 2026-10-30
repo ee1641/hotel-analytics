@@ -105,7 +105,11 @@ col_ctrl1, col_ctrl2 = st.columns(2)
 with col_ctrl1:
     series_choice = st.radio("Series", ["Revenue", "Demand"], horizontal=True)
 with col_ctrl2:
-    model_choice = st.radio("Forecast Model", ["XGBoost", "Prophet", "Naive Baseline"], horizontal=True)
+    model_choice = st.radio(
+        "Forecast Model",
+        ["XGBoost", "Ensemble (XGB+Prophet)", "Prophet", "Naive Baseline"],
+        horizontal=True,
+    )
 
 if series_choice == "Revenue":
     revenue_type = st.radio(
@@ -191,8 +195,10 @@ with metric_cols[2]:
     st.metric("MAE", f"{m_naive['mae']:,.1f}")
     st.metric("MAPE", f"{m_naive['mape']:.1f}%")
 
+_m_ensemble = eval_metrics.get(f"{xgb_metric_key}_ensemble", {})
 selected_mape = {
     "XGBoost": m_xgb["mape"],
+    "Ensemble (XGB+Prophet)": _m_ensemble.get("mape", m_xgb["mape"]),
     "Prophet": m_prophet.get("mape", m_naive["mape"]),
     "Naive Baseline": m_naive["mape"],
 }[model_choice]
@@ -320,6 +326,19 @@ if model_choice == "XGBoost":
     else:
         forecast_30 = forecast_xgb(xgb_model, feat_cols, series, periods=30,
                                    future_features=_future_otb)
+elif model_choice == "Ensemble (XGB+Prophet)":
+    # Blend XGB and Prophet using the CACHED weight (fit on a validation window
+    # at training time, never the live series). Falls back to pure XGB if no
+    # weight is available.
+    _ens_key = "revenue" if series_choice == "Revenue" else "demand"
+    _ens_w = float((models.get("ensemble_weights") or {}).get(_ens_key, 1.0))
+    _xgb_fc = forecast_xgb(xgb_model, feat_cols, series, periods=30,
+                           future_features=_future_otb)
+    _prophet_df = forecast_prophet(prophet_model, periods=30)
+    forecast_30 = blend_forecasts(_xgb_fc, _prophet_df, _ens_w).rename("forecast")
+    forecast_30.index = _xgb_fc.index
+    st.caption(f"Ensemble weight: {_ens_w:.0%} XGBoost / {1 - _ens_w:.0%} Prophet "
+               "(fit on a validation window, not the displayed forecast).")
 elif model_choice == "Prophet":
     band_df = forecast_prophet(prophet_model, periods=30)
     band_df["ds"] = pd.to_datetime(band_df["ds"])
@@ -339,6 +358,9 @@ _BACKTEST_DAYS = 30
 
 _bt_pred_key = {
     "XGBoost": xgb_metric_key + "_preds",
+    # No stored ensemble prediction array; overlay the XGB backtest line as a
+    # visual reference (the blend is XGB-dominated on this data).
+    "Ensemble (XGB+Prophet)": xgb_metric_key + "_preds",
     "Prophet": prophet_metric_key + "_preds",
     "Naive Baseline": naive_key + "_preds",
 }[model_choice]

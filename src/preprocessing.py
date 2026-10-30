@@ -282,6 +282,51 @@ def target_encode_column(
     return full_df[col].map(rates).fillna(global_mean).astype(float)
 
 
+def expanding_target_encode(
+    train_df: pd.DataFrame,
+    col: str,
+    target_col: str = "is_canceled",
+    *,
+    sort_col: str = "arrival_date",
+    smoothing: float = 20.0,
+    global_mean: float | None = None,
+) -> pd.Series:
+    """
+    Past-only, smoothed target encoding for TRAINING rows.
+
+    For each row (ordered by ``sort_col``), the encoding uses only the labels of
+    earlier rows in the same category — never the row's own label — so it does
+    not leak the target into its own feature. Each estimate is smoothed toward
+    the global mean so rare/new categories don't get noisy extremes::
+
+        enc_i = (sum_prior + k * global_mean) / (count_prior + k)
+
+    A category's first occurrence falls back to ``global_mean`` (no prior). This
+    reflects how cancellation behaviour per agent/country drifts over the
+    2015–2017 span, and removes the self-label leak the static full-train mean
+    carried. The static final map (``train_df.groupby(col).mean()``) is still
+    used for TEST rows and at inference — see services.py.
+
+    Returns a Series aligned to ``train_df.index``.
+    """
+    if global_mean is None:
+        global_mean = float(train_df[target_col].mean())
+    k = float(smoothing)
+
+    work = train_df[[col, target_col]].copy()
+    if sort_col in train_df.columns:
+        order = train_df[sort_col].values
+        work = work.assign(_order=order).sort_values("_order", kind="stable")
+    grp = work.groupby(col)[target_col]
+    # Exclusive per-category cumsum: subtract the row's own label so it never
+    # leaks into its own prior (a global .shift(1) would cross categories).
+    prior_sum = grp.cumsum() - work[target_col]
+    prior_count = grp.cumcount()  # number of earlier rows in this category
+    enc = (prior_sum + k * global_mean) / (prior_count + k)
+    enc = enc.reindex(train_df.index)  # restore original row order
+    return enc.fillna(global_mean).astype(float)
+
+
 def compute_group_rates(
     train_df: pd.DataFrame,
     full_df: pd.DataFrame,

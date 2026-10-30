@@ -101,7 +101,7 @@ def evaluate_cancellation() -> dict:
 
     # Fit isotonic calibrator on time-series OOF training predictions, then
     # apply to holdout probabilities.
-    calibrator = train_probability_calibrator(models, X_tr.values, y_tr.values)
+    calibrator, _calib_oof = train_probability_calibrator(models, X_tr.values, y_tr.values)
     proba_cal = (apply_probability_calibrator(calibrator, proba_uncal)
                  if calibrator is not None else proba_uncal)
     if calibrator is None:

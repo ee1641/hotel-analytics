@@ -4,6 +4,7 @@ import pytest
 from src.preprocessing import (
     load_data, clean_data, engineer_features, encode_categoricals,
     drop_leaky_features, LEAKY_COLUMNS, remove_accidental_duplicate_bookings,
+    expanding_target_encode, target_encode_column,
 )
 
 DATA_PATH = "hotel_bookings.csv"
@@ -196,3 +197,75 @@ def test_time_split_no_future_data_in_train():
     train = df_sorted.iloc[:-n_test]
     test = df_sorted.iloc[-n_test:]
     assert train["arrival_date"].max() < test["arrival_date"].min()
+
+
+# ---------------------------------------------------------------------------
+# Expanding-window target encoding (Track 10, Part 4)
+# ---------------------------------------------------------------------------
+
+def _te_frame():
+    # category "A" appears 3 times with labels 1, 0, 1 (in arrival_date order);
+    # category "B" once. global mean = 0.6.
+    return pd.DataFrame({
+        "arrival_date": pd.to_datetime([
+            "2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04", "2020-01-05",
+        ]),
+        "agent": ["A", "A", "B", "A", "B"],
+        "is_canceled": [1, 0, 1, 1, 0],
+    })
+
+
+def test_expanding_first_occurrence_is_global_mean():
+    df = _te_frame()
+    gmean = float(df["is_canceled"].mean())
+    enc = expanding_target_encode(df, "agent", global_mean=gmean, smoothing=20.0)
+    # First row of category A and first row of category B have no prior → global mean.
+    assert enc.iloc[0] == pytest.approx(gmean)  # A, first
+    assert enc.iloc[2] == pytest.approx(gmean)  # B, first
+
+
+def test_expanding_excludes_own_label():
+    """Row 4 (3rd 'A') must encode from rows 1-2's labels only (1, 0), never its own."""
+    df = _te_frame()
+    gmean, k = 0.6, 20.0
+    enc = expanding_target_encode(df, "agent", global_mean=gmean, smoothing=k)
+    # 3rd A: prior labels [1, 0] → sum=1, count=2 → (1 + k*gmean)/(2+k)
+    expected = (1 + k * gmean) / (2 + k)
+    assert enc.iloc[3] == pytest.approx(expected)
+    # 2nd A (row index 1): prior labels [1] → (1 + k*gmean)/(1+k)
+    expected_2nd = (1 + k * gmean) / (1 + k)
+    assert enc.iloc[1] == pytest.approx(expected_2nd)
+
+
+def test_expanding_prior_does_not_cross_categories():
+    """2nd 'B' (row 4) follows an 'A' row; its prior must be B's labels only ([1])."""
+    df = _te_frame()
+    gmean, k = 0.6, 20.0
+    enc = expanding_target_encode(df, "agent", global_mean=gmean, smoothing=k)
+    assert enc.iloc[4] == pytest.approx((1 + k * gmean) / (1 + k))
+    assert enc.between(0.0, 1.0).all()
+
+
+def test_expanding_preserves_index_order():
+    df = _te_frame()
+    enc = expanding_target_encode(df, "agent", global_mean=0.6)
+    assert list(enc.index) == list(df.index)
+    assert len(enc) == len(df)
+    assert enc.notna().all()
+
+
+def test_expanding_handles_unsorted_input():
+    """Encoding must order by arrival_date internally, then restore row order."""
+    df = _te_frame().sample(frac=1.0, random_state=1)  # shuffle rows
+    enc = expanding_target_encode(df, "agent", global_mean=0.6, smoothing=20.0)
+    # The row that is chronologically first for its category still gets global mean.
+    first_a_label_row = df.index[df["arrival_date"] == df["arrival_date"].min()][0]
+    assert enc.loc[first_a_label_row] == pytest.approx(0.6)
+
+
+def test_static_map_unchanged_for_inference():
+    """The static final map (inference contract) is unaffected by expanding encoding."""
+    df = _te_frame()
+    rate_map = df.groupby("agent")["is_canceled"].mean().to_dict()
+    assert rate_map["A"] == pytest.approx(2 / 3)  # labels 1,0,1
+    assert rate_map["B"] == pytest.approx(0.5)    # labels 1,0

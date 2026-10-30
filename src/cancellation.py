@@ -419,8 +419,16 @@ def train_probability_calibrator(
 
     base_models must already contain a fitted ``stacked_meta`` — the same
     meta-learner is reused per fold to convert refit base-model predictions
-    into stacked probabilities. Returns a fitted ``IsotonicRegression`` (callable
-    via ``apply_probability_calibrator``) or ``None`` if calibration is infeasible.
+    into stacked probabilities.
+
+    Returns ``(calibrator, oof_df)`` where:
+      - ``calibrator`` is a fitted ``IsotonicRegression`` (apply via
+        ``apply_probability_calibrator``) or ``None`` if calibration is infeasible.
+      - ``oof_df`` is a DataFrame with columns ``proba_raw`` (out-of-fold raw
+        stacked probability) and ``y`` (label) over the covered rows, or ``None``.
+        These OOF predictions are training-time only and are the correct,
+        leakage-free basis for selecting the decision threshold — unlike the
+        test holdout, which must stay untouched until final reporting.
     """
     from sklearn.isotonic import IsotonicRegression
 
@@ -430,7 +438,7 @@ def train_probability_calibrator(
 
     model_names = [k for k in base_models if k not in _NON_MODEL_KEYS]
     if not model_names:
-        return None
+        return None, None
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     oof_stacked = np.zeros(len(X_tr))
@@ -447,11 +455,16 @@ def train_probability_calibrator(
         covered[val_idx] = True
 
     if covered.sum() < 10 or len(np.unique(y_tr[covered])) < 2:
-        return None
+        return None, None
+
+    oof_df = pd.DataFrame({
+        "proba_raw": oof_stacked[covered],
+        "y": y_tr[covered].astype(int),
+    })
 
     calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     calibrator.fit(oof_stacked[covered], y_tr[covered])
-    return calibrator
+    return calibrator, oof_df
 
 
 def apply_probability_calibrator(calibrator, raw_proba: np.ndarray) -> np.ndarray:

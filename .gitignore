@@ -19,3 +19,10 @@ outputs/*.png
 # OS
 .DS_Store
 Thumbs.db
+
+# Training artifacts / local caches
+catboost_info/
+data/streamlit_uploads/
+data/metrics_history.jsonl
+outputs/*.log
+*.patch

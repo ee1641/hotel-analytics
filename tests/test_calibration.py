@@ -27,7 +27,7 @@ def stacked_bundle():
     base = train_cancellation_models_balanced(X, y)
     meta = train_stacked_cancellation_model(base, X, y, n_splits=3)
     base["stacked_meta"] = meta
-    calibrator = train_probability_calibrator(base, X, y, n_splits=3)
+    calibrator, _oof = train_probability_calibrator(base, X, y, n_splits=3)
     base["probability_calibrator"] = calibrator
     return X, y, base
 
@@ -70,12 +70,27 @@ def test_calibrator_is_none_when_data_too_small():
     base = train_cancellation_models_balanced(X, y)
     meta = train_stacked_cancellation_model(base, X, y, n_splits=3)
     base["stacked_meta"] = meta
-    cal = train_probability_calibrator(base, X, y, n_splits=3)
+    cal, oof = train_probability_calibrator(base, X, y, n_splits=3)
     # Either None (not enough covered rows) or a fitted regressor — both are fine,
-    # but it must not raise.
+    # but it must not raise. OOF data tracks the calibrator's availability.
     if cal is not None:
         out = apply_probability_calibrator(cal, np.array([0.2, 0.8]))
         assert ((out >= 0.0) & (out <= 1.0)).all()
+        assert oof is not None and {"proba_raw", "y"}.issubset(oof.columns)
+    else:
+        assert oof is None
+
+
+def test_calibrator_returns_oof_for_threshold_selection(stacked_bundle):
+    """The OOF DataFrame is the leakage-free basis for threshold selection: it
+    must cover training rows only and carry calibratable raw probabilities."""
+    X, y, base = stacked_bundle
+    cal, oof = train_probability_calibrator(base, X, y, n_splits=3)
+    assert cal is not None and oof is not None
+    assert list(oof.columns) == ["proba_raw", "y"]
+    assert len(oof) <= len(X)               # OOF covers a subset of training rows
+    assert oof["proba_raw"].between(0, 1).all()
+    assert set(oof["y"].unique()).issubset({0, 1})
 
 
 def test_non_model_keys_includes_calibrator():

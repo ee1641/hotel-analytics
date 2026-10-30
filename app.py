@@ -670,8 +670,10 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
         dem_naive.index = dem_test.index
         dem_prophet_df = forecast_prophet(train_prophet_forecaster(dem_train), len(dem_test))
 
-        # Ensemble blend for demand
-        _dem_w = find_ensemble_weights(dem_xgb_preds.values, dem_prophet_df["yhat"].values, dem_test.values)
+        # Ensemble blend for demand — use the CACHED weight (fit on a validation
+        # window before the holdout). Fitting it on dem_test here would leak the
+        # holdout into the reported ensemble metric.
+        _dem_w = float((results.get("ensemble_weights") or {}).get("demand", 1.0))
         dem_ensemble = blend_forecasts(dem_xgb_preds, dem_prophet_df, _dem_w)
 
         eval_metrics = {
@@ -712,7 +714,8 @@ def _get_or_train_models_for_context(data_path: str, models_dir: str, dataset_id
             rev_naive.index = rev_test.index
             rev_prophet_df = forecast_prophet(train_prophet_forecaster(rev_train), len(rev_test))
 
-            _rev_w = find_ensemble_weights(rev_xgb_preds.values, rev_prophet_df["yhat"].values, rev_test.values)
+            # Cached weight, not a fresh fit on rev_test (which would leak the holdout).
+            _rev_w = float((results.get("ensemble_weights") or {}).get("revenue", 1.0))
             rev_ensemble = blend_forecasts(rev_xgb_preds, rev_prophet_df, _rev_w)
             eval_metrics[f"{metric_xgb}_baseline"] = regression_metrics(rev_test.values, rev_base_preds.values)
             eval_metrics[metric_xgb] = regression_metrics(rev_test.values, rev_xgb_preds.values)

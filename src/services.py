@@ -9,6 +9,7 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
+import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
@@ -40,6 +41,8 @@ from src.evaluation import (
     ts_cross_val_scores,
 )
 from src.forecasting import (
+    blend_forecasts,
+    find_ensemble_weights,
     forecast_prophet,
     forecast_xgb,
     forecast_xgb_direct,
@@ -57,6 +60,7 @@ from src.model_specs import (
     CANCELLATION_MODEL_VERSION,
     CONFORMAL_INTERVAL_VERSION,
     DIRECT_FORECAST_MODEL_VERSION,
+    ENSEMBLE_WEIGHTS_VERSION,
     EVAL_METRICS_VERSION,
     FORECAST_LAGS,
     FORECAST_MODEL_VERSION,
@@ -73,6 +77,7 @@ from src.preprocessing import (
     drop_leaky_features,
     encode_categoricals,
     engineer_features,
+    expanding_target_encode,
     load_data,
     target_encode_column,
 )
@@ -107,28 +112,26 @@ def load_and_prepare_data(data_path: str = DATA_PATH, *, dataset_context=None):
     return df, daily_df
 
 
-def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
+# Exogenous demand-feature columns that are genuinely known for FUTURE dates
+# at forecast time: trends are published externally; OTB/pace describe bookings
+# already on the books for future arrival dates. cancel_rate_lag7 is a lagged
+# actual (only known 7 days ahead) and is deliberately excluded.
+DEMAND_FUTURE_FEATURE_COLS = list(TRENDS_FEATURE_COLS) + [
+    "otb_30d", "otb_60d", "otb_30d_stly", "otb_60d_stly",
+    "pace_ratio_30d", "pace_ratio_60d",
+]
+
+
+def build_demand_extra_features(df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Load cached ML artifacts from disk or train them fresh.
+    Demand exogenous features — cancel rate lag, Google Trends, OTB (30d/60d),
+    STLY OTB, and pace ratios — aligned to ``daily_df.index``.
+
+    Only otb_30d and otb_60d are included: for a 30-day-ahead forecast these
+    are the only OTB snapshots that are available at prediction time without
+    leaking future booking information. Reused by training, the eval block,
+    and the rolling backtest CLI (scripts/backtest.py).
     """
-    models_dir = model_cache.MODELS_DIR
-    if dataset_context is not None:
-        data_path = dataset_context.data_path
-        models_dir = Path(dataset_context.models_dir)
-
-    df, daily_df = load_and_prepare_data(data_path)
-    results = {}
-
-    rev_series = daily_df["daily_revenue"]
-    dem_series = daily_df["daily_bookings"]
-
-    # ------------------------------------------------------------------
-    # Demand extra features — cancel rate lag, Google Trends, OTB (30d/60d)
-    # Built once here; reused by both the full demand model and the eval block.
-    # Only otb_30d and otb_60d are included: for a 30-day-ahead forecast these
-    # are the only OTB snapshots that are available at prediction time without
-    # leaking future booking information.
-    # ------------------------------------------------------------------
     _cancel_rate_raw = daily_df["daily_cancellation_rate"]
     _cancel_rate_feat = pd.DataFrame(
         {"cancel_rate_lag7": _cancel_rate_raw.shift(7).fillna(0.0)},
@@ -160,7 +163,25 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
     _pace_feat["pace_ratio_30d"] = _otb_feat["otb_30d"] / _otb_stly["otb_30d_stly"].clip(lower=1)
     _pace_feat["pace_ratio_60d"] = _otb_feat["otb_60d"] / _otb_stly["otb_60d_stly"].clip(lower=1)
 
-    demand_extra = pd.concat([_cancel_rate_feat, _trends_feat, _otb_feat, _otb_stly, _pace_feat], axis=1)
+    return pd.concat([_cancel_rate_feat, _trends_feat, _otb_feat, _otb_stly, _pace_feat], axis=1)
+
+
+def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
+    """
+    Load cached ML artifacts from disk or train them fresh.
+    """
+    models_dir = model_cache.MODELS_DIR
+    if dataset_context is not None:
+        data_path = dataset_context.data_path
+        models_dir = Path(dataset_context.models_dir)
+
+    df, daily_df = load_and_prepare_data(data_path)
+    results = {}
+
+    rev_series = daily_df["daily_revenue"]
+    dem_series = daily_df["daily_bookings"]
+
+    demand_extra = build_demand_extra_features(df, daily_df)
 
     # ------------------------------------------------------------------
     # Revenue forecasting
@@ -257,6 +278,42 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         _save_versioned("prophet_demand", prophet_dem, PROPHET_MODEL_VERSION, models_dir)
 
     # ------------------------------------------------------------------
+    # Ensemble weights (XGB share of the XGB+Prophet blend), fit on a 60-day
+    # validation window before a 30-day holdout — never the holdout itself.
+    # Cached so API/serving contexts can blend without refitting a weight.
+    # ------------------------------------------------------------------
+    if _artifact_current("ensemble_weights", ENSEMBLE_WEIGHTS_VERSION, models_dir):
+        results["ensemble_weights"] = model_cache.load_artifact("ensemble_weights", models_dir=models_dir)
+    else:
+        ensemble_weights = {"demand": 1.0, "revenue": 1.0}
+        try:
+            val_days, test_days_ew = 60, 30
+            for label, series_ew, extra_ew in [
+                ("demand", dem_series, demand_extra),
+                ("revenue", rev_series, None),
+            ]:
+                if len(series_ew) <= val_days + test_days_ew + MIN_FORECAST_HISTORY:
+                    continue
+                val = series_ew.iloc[-(test_days_ew + val_days):-test_days_ew]
+                val_train = series_ew.iloc[:-(test_days_ew + val_days)]
+                inner_extra = extra_ew.reindex(val_train.index) if extra_ew is not None else None
+                future_extra = (
+                    extra_ew[DEMAND_FUTURE_FEATURE_COLS].reindex(val.index, fill_value=0)
+                    if extra_ew is not None else None
+                )
+                xgb_m, xgb_c = train_xgb_forecaster(
+                    val_train, lags=FORECAST_LAGS, extra_features=inner_extra)
+                xgb_v = forecast_xgb(xgb_m, xgb_c, val_train, val_days,
+                                     future_features=future_extra)
+                prophet_v = forecast_prophet(train_prophet_forecaster(val_train), val_days)
+                ensemble_weights[label] = find_ensemble_weights(
+                    xgb_v.values, prophet_v["yhat"].values, val.values)
+        except Exception as exc:
+            log.warning("Ensemble weight computation failed: %s", exc)
+        results["ensemble_weights"] = ensemble_weights
+        _save_versioned("ensemble_weights", ensemble_weights, ENSEMBLE_WEIGHTS_VERSION, models_dir)
+
+    # ------------------------------------------------------------------
     # Cancellation classification
     # ------------------------------------------------------------------
     if _artifact_current("cancel_models", CANCELLATION_MODEL_VERSION, models_dir):
@@ -303,15 +360,30 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
 
         X, y_cancel, _ = encode_categoricals(drop_leaky_features(df_full_with_rates))
 
-        # Re-apply target encoding to X (encode_categoricals re-runs label encoding)
+        # Re-apply target encoding to X (encode_categoricals re-runs label encoding).
+        # TRAIN rows get a past-only smoothed *expanding* encoding — each row sees
+        # only earlier rows' labels in its category, so a row never encodes its own
+        # outcome, and the estimate tracks behaviour drift over 2015–2017. TEST rows
+        # (and inference) use the static final train map, which stays the serving
+        # contract that booking_risk_scorer / api consume unchanged.
+        n_train = len(X) - n_test
         for col in TARGET_ENCODED_COLS:
             if col in X.columns and col in target_encode_maps:
                 rate_map = target_encode_maps[col]
-                # X[col] currently holds label-encoded integers; replace with target rates
                 original_col = df_full_with_rates[col] if col in df_full_with_rates.columns else None
-                if original_col is not None:
-                    X[col] = original_col.values
-                    X[col] = X[col].map(rate_map).fillna(global_cancel_mean).astype(float)
+                if original_col is None:
+                    continue
+                raw_vals = pd.Series(original_col.values, index=X.index)
+                # Static map for all rows (test + fallback for unseen-in-train cats)
+                static_enc = raw_vals.map(rate_map).fillna(global_cancel_mean).astype(float)
+                # Expanding encoding for the train slice only
+                train_raw = df_full_with_rates.iloc[:n_train]
+                exp_enc = expanding_target_encode(
+                    train_raw, col, global_mean=global_cancel_mean,
+                )
+                encoded = static_enc.copy()
+                encoded.iloc[:n_train] = exp_enc.values
+                X[col] = encoded.values
 
         feature_columns = list(X.columns)
 
@@ -364,10 +436,12 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         # frequencies rather than raw stacker scores.
         log.info("Fitting probability calibrator on OOF stacked predictions...")
         try:
-            calibrator = train_probability_calibrator(cancel_models, X_tr.values, y_tr.values)
+            calibrator, calib_oof = train_probability_calibrator(
+                cancel_models, X_tr.values, y_tr.values
+            )
         except Exception as exc:
             log.warning("Probability calibration failed, falling back to raw probs: %s", exc)
-            calibrator = None
+            calibrator, calib_oof = None, None
         cancel_models["probability_calibrator"] = calibrator
 
         import matplotlib
@@ -396,21 +470,41 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             log.warning("SHAP feature importance failed: %s", exc)
             selected_features = feature_columns
 
-        # Find optimal threshold on calibrated probabilities — production callers
-        # consume calibrated probs, so the threshold must be optimised on the same.
+        # Choose the decision threshold on TRAINING-time out-of-fold predictions,
+        # not the test holdout. Selecting on the same holdout used to report
+        # accuracy biases the headline number and produces an unstable threshold
+        # (it chases holdout noise). The OOF predictions are calibrated with the
+        # same isotonic map production consumes, so the threshold matches serving.
         try:
+            from sklearn.metrics import accuracy_score as _acc
+            if calib_oof is not None and len(calib_oof) >= 10:
+                oof_proba_cal = apply_probability_calibrator(
+                    calibrator, calib_oof["proba_raw"].values
+                )
+                optimal_threshold, oof_acc = find_optimal_threshold(
+                    calib_oof["y"].values, oof_proba_cal
+                )
+            else:
+                optimal_threshold, oof_acc = 0.5, float("nan")
+            cancel_models["optimal_threshold"] = optimal_threshold
+
+            # Honest holdout accuracy: threshold fixed from OOF, evaluated on the
+            # untouched test set. Also log the (biased) test-tuned accuracy once
+            # for the record, to quantify the inflation that selection caused.
             stacked_proba_te = predict_stacked_proba(
                 stacked_meta, cancel_models, X_te.values,
                 calibrator=calibrator,
             )
-            optimal_threshold, optimal_acc = find_optimal_threshold(y_te.values, stacked_proba_te)
-            cancel_models["optimal_threshold"] = optimal_threshold
+            honest_acc = float(_acc(y_te.values, (stacked_proba_te >= optimal_threshold).astype(int)))
+            _, biased_acc = find_optimal_threshold(y_te.values, stacked_proba_te)
             log.info(
-                "Stacked model (calibrated) — optimal threshold: %.2f, holdout accuracy: %.3f",
-                optimal_threshold, optimal_acc,
+                "Stacked (calibrated) — OOF-selected threshold: %.2f | "
+                "OOF acc: %.3f | honest holdout acc: %.3f | "
+                "(test-tuned acc would report %.3f — inflation %.3f)",
+                optimal_threshold, oof_acc, honest_acc, biased_acc, biased_acc - honest_acc,
             )
         except Exception as exc:
-            log.warning("Threshold optimisation failed: %s", exc)
+            log.warning("Threshold selection failed: %s", exc)
             cancel_models["optimal_threshold"] = 0.5
 
         # Print per-model metrics on holdout
@@ -521,12 +615,12 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         dem_eval_xgb_m, dem_eval_xgb_c = train_xgb_forecaster(
             dem_eval_train, lags=FORECAST_LAGS, extra_features=dem_extra_train
         )
-        future_features_dem = pd.concat([
-            _trends_feat.reindex(dem_eval_test.index),
-            _otb_feat.reindex(dem_eval_test.index, fill_value=0),
-            _otb_stly.reindex(dem_eval_test.index, fill_value=0),
-            _pace_feat.reindex(dem_eval_test.index, fill_value=0),
-        ], axis=1)
+        # Forward-looking signals only (trends + OTB + pace) for the test window —
+        # the columns genuinely known at real forecast time. cancel_rate_lag7 is
+        # a lagged actual and is excluded.
+        future_features_dem = demand_extra[DEMAND_FUTURE_FEATURE_COLS].reindex(
+            dem_eval_test.index, fill_value=0
+        )
         dem_xgb_preds = forecast_xgb(
             dem_eval_xgb_m, dem_eval_xgb_c, dem_eval_train, test_days,
             future_features=future_features_dem,
@@ -537,6 +631,61 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
         dem_eval_prophet = train_prophet_forecaster(dem_eval_train)
         dem_prophet_df = forecast_prophet(dem_eval_prophet, test_days)
 
+        # ----------------------------------------------------------------
+        # Candidate models that were previously UI-only: XGB+Prophet ensemble
+        # and direct multi-step. The ensemble weight is fit on the 60 days
+        # before the test window (never the test window itself) so this metric
+        # is honest — unlike the old app.py display weight that fit on the test
+        # holdout. These rows let the Validation page and drift snapshots show
+        # whether the ensemble/direct variants actually beat plain recursive XGB.
+        # ----------------------------------------------------------------
+        eval_ensemble = {}
+        for label, e_train, e_test, e_xgb_preds, e_prophet_df in [
+            ("revenue", rev_eval_train, rev_eval_test, rev_xgb_preds, rev_prophet_df),
+            ("demand", dem_eval_train, dem_eval_test, dem_xgb_preds, dem_prophet_df),
+        ]:
+            try:
+                w_val_days = 60
+                if len(e_train) > w_val_days + MIN_FORECAST_HISTORY:
+                    w_inner = e_train.iloc[:-w_val_days]
+                    w_val = e_train.iloc[-w_val_days:]
+                    if label == "demand":
+                        w_inner_extra = demand_extra.reindex(w_inner.index)
+                        w_future = demand_extra[DEMAND_FUTURE_FEATURE_COLS].reindex(
+                            w_val.index, fill_value=0)
+                    else:
+                        w_inner_extra, w_future = None, None
+                    w_xgb_m, w_xgb_c = train_xgb_forecaster(
+                        w_inner, lags=FORECAST_LAGS, extra_features=w_inner_extra)
+                    w_xgb = forecast_xgb(w_xgb_m, w_xgb_c, w_inner, w_val_days,
+                                         future_features=w_future)
+                    w_prophet = forecast_prophet(train_prophet_forecaster(w_inner), w_val_days)
+                    weight = find_ensemble_weights(
+                        w_xgb.values, w_prophet["yhat"].values, w_val.values)
+                else:
+                    weight = 1.0
+                ens_preds = blend_forecasts(e_xgb_preds, e_prophet_df, weight)
+                eval_ensemble[f"{label}_ensemble"] = {
+                    **regression_metrics(e_test.values, ens_preds.values),
+                    "xgb_weight": float(weight),
+                }
+            except Exception as exc:
+                log.warning("Ensemble eval failed for %s: %s", label, exc)
+
+        eval_direct = {}
+        for label, e_train, e_test in [
+            ("revenue", rev_eval_train, rev_eval_test),
+            ("demand", dem_eval_train, dem_eval_test),
+        ]:
+            try:
+                direct_models = train_xgb_direct_multistep(
+                    e_train, horizons=test_days, lags=FORECAST_LAGS)
+                direct_preds = forecast_xgb_direct(direct_models, e_train)
+                eval_direct[f"{label}_xgb_direct"] = regression_metrics(
+                    e_test.values, np.asarray(direct_preds)[:test_days])
+            except Exception as exc:
+                log.warning("Direct multi-step eval failed for %s: %s", label, exc)
+
         eval_metrics = {
             "revenue_xgb": regression_metrics(rev_eval_test.values, rev_xgb_preds.values),
             "revenue_prophet": regression_metrics(rev_eval_test.values, rev_prophet_df["yhat"].values),
@@ -544,6 +693,8 @@ def get_or_train_models(data_path: str = DATA_PATH, *, dataset_context=None):
             "demand_xgb": regression_metrics(dem_eval_test.values, dem_xgb_preds.values),
             "demand_prophet": regression_metrics(dem_eval_test.values, dem_prophet_df["yhat"].values),
             "demand_naive": regression_metrics(dem_eval_test.values, dem_naive.values),
+            **eval_ensemble,
+            **eval_direct,
             "eval_note": (
                 f"Holdout: last {test_days} days (unseen during training). "
                 "Production models are retrained on the full dataset for live forecasts."
